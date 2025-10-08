@@ -56,34 +56,34 @@ python custom_training.py --action validate --model_path runs/detect/basketball_
 ### 2. Test with Single Image/Screenshot
 
 ```bash
-# Test with trained model on default test image
-python test_simple.py --model runs/detect/basketball_yolo11n/weights/best.pt
+# Enhanced detection system (RECOMMENDED)
+python test_enhanced.py --image test.png --model runs/detect/basketball_yolo11n2/weights/best.pt --show
 
-# Test with specific image and show results
-python test_simple.py --model runs/detect/basketball_yolo11n/weights/best.pt --image test.png --show
+# Basic detection system
+python test_simple.py --model runs/detect/basketball_yolo11n2/weights/best.pt --image test.png --show
 
 # Test with pre-trained YOLO model (limited accuracy)
 python test_simple.py --image test.png
 ```
 
-### 3. Live Camera Detection with Shot Tracking
+### 3. Live Camera Detection with Enhanced Shot Tracking
 
 ```bash
-# Live detection with trained model and shot tracking
-python main.py --action live --model runs/detect/basketball_yolo11n/weights/best.pt
+# Enhanced live detection with physics-based shot analysis
+python main.py --action live --model runs/detect/basketball_yolo11n2/weights/best.pt
 
-# Live detection with specific camera
-python main.py --action live --model runs/detect/basketball_yolo11n/weights/best.pt --camera 1
+# Enhanced live detection with specific camera
+python main.py --action live --model runs/detect/basketball_yolo11n2/weights/best.pt --camera 1
 ```
 
-### 4. Process Videos
+### 4. Process Videos with Enhanced Analysis
 
 ```bash
-# Process single video with shot detection and overlay
-python main.py --action video --video_path your_video.mp4 --model runs/detect/basketball_yolo11n/weights/best.pt
+# Process single video with enhanced shot detection and overlay
+python main.py --action video --video_path your_video.mp4 --model runs/detect/basketball_yolo11n2/weights/best.pt
 
 # Process multiple videos in batch
-python main.py --action batch --video_dir videos/ --model runs/detect/basketball_yolo11n/weights/best.pt --output_dir processed/
+python main.py --action batch --video_dir videos/ --model runs/detect/basketball_yolo11n2/weights/best.pt --output_dir processed/
 ```
 
 ### 5. Export Trained Model

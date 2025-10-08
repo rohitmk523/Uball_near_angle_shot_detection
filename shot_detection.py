@@ -154,15 +154,37 @@ class ShotAnalyzer:
         self.model = YOLO(model_path)
         self.model_path = model_path
         
+        # Enable GPU acceleration for MacBook M-series chips
+        import torch
+        if torch.backends.mps.is_available():
+            self.device = 'mps'
+            print(f"🚀 Using MacBook GPU (MPS) acceleration")
+        elif torch.cuda.is_available():
+            self.device = 'cuda'
+            print(f"🚀 Using CUDA GPU acceleration")
+        else:
+            self.device = 'cpu'
+            print("ℹ️ Using CPU")
+        
+        # Move model to device
+        self.model.to(self.device)
+        
         # Detection thresholds
-        self.basketball_confidence = 0.5
+        self.basketball_confidence = 0.35
         self.hoop_confidence = 0.5
         
-        # Shot tracking
-        self.active_shots = {}
-        self.completed_shots = []
-        self.shot_counter = 0
-        self.next_shot_id = 1
+        # Improved shot detection with box overlap
+        self.hoop_area = None
+        self.hoop_center = None
+        self.hoop_size = None
+        self.hoop_bbox = None
+        
+        # Shot sequence grouping to prevent multiple detections
+        self.shot_sequence_active = False
+        self.shot_sequence_start_time = None
+        self.shot_sequence_overlaps = []  # Store all overlaps in current sequence
+        self.shot_sequence_timeout = 3.0  # 3 seconds to group overlaps into one shot
+        self.current_overlap_percentage = 0
         
         # Statistics
         self.stats = {
@@ -178,7 +200,7 @@ class ShotAnalyzer:
         
     def detect_objects(self, frame):
         """Detect basketball and hoop in frame"""
-        results = self.model(frame, conf=0.3, verbose=False)
+        results = self.model(frame, conf=0.3, verbose=False, device=self.device)
         
         detections = {
             'basketball': [],
@@ -225,166 +247,298 @@ class ShotAnalyzer:
         return detections
         
     def update_shot_tracking(self, detections):
-        """Update shot tracking with new detections"""
+        """Simple shot detection: 100% overlap = made, any overlap = missed"""
         basketball_positions = [ball['center'] for ball in detections['basketball']]
         hoop_positions = [hoop['center'] for hoop in detections['basketball_hoop']]
         
-        # Update existing shots
-        shots_to_remove = []
-        for shot_id, shot_tracker in self.active_shots.items():
-            # Find closest basketball to this shot
-            if basketball_positions:
-                distances = [
-                    math.sqrt((pos[0] - shot_tracker.trajectory[-1][0])**2 + 
-                             (pos[1] - shot_tracker.trajectory[-1][1])**2)
-                    for pos in basketball_positions
-                ]
-                min_distance = min(distances)
-                closest_idx = distances.index(min_distance)
-                
-                if min_distance < 100:  # Ball still being tracked
-                    shot_tracker.update_position(basketball_positions[closest_idx])
-                    basketball_positions.pop(closest_idx)  # Remove matched ball
-                else:
-                    # Ball lost, complete the shot
-                    if hoop_positions:
-                        shot_tracker.determine_outcome_with_hoop(hoop_positions[0])
-                    else:
-                        shot_tracker._determine_shot_outcome()
-                    shots_to_remove.append(shot_id)
-            else:
-                # No basketballs detected, complete existing shots
-                if hoop_positions:
-                    shot_tracker.determine_outcome_with_hoop(hoop_positions[0])
-                else:
-                    shot_tracker._determine_shot_outcome()
-                shots_to_remove.append(shot_id)
-                
-        # Remove completed shots
-        for shot_id in shots_to_remove:
-            completed_shot = self.active_shots.pop(shot_id)
-            self.completed_shots.append(completed_shot)
-            self._log_completed_shot(completed_shot)
+        # Update hoop area if hoop detected
+        if hoop_positions:
+            hoop = detections['basketball_hoop'][0]  # Use first detected hoop
+            self.hoop_center = hoop['center']
+            self.hoop_bbox = hoop['bbox']  # Store actual hoop bbox for overlap detection
+            self.hoop_size = max(self.hoop_bbox[2] - self.hoop_bbox[0], 
+                               self.hoop_bbox[3] - self.hoop_bbox[1])
             
-        # Create new shots for unmatched basketballs
-        for position in basketball_positions:
-            shot_tracker = ShotTracker(self.next_shot_id, position)
-            self.active_shots[self.next_shot_id] = shot_tracker
-            self.next_shot_id += 1
+            # Define hoop shooting area (expanded around hoop)
+            margin = int(self.hoop_size * 0.8)  # 80% of hoop size as margin
+            x1 = self.hoop_bbox[0] - margin
+            y1 = self.hoop_bbox[1] - margin  
+            x2 = self.hoop_bbox[2] + margin
+            y2 = self.hoop_bbox[3] + margin
+            self.hoop_area = [x1, y1, x2, y2]
             
-    def _log_completed_shot(self, shot_tracker):
-        """Log completed shot to statistics and JSON log"""
+        current_time = time.time()
+        
+        # Check for shot sequence timeout
+        if (self.shot_sequence_active and 
+            self.shot_sequence_start_time and 
+            current_time - self.shot_sequence_start_time > self.shot_sequence_timeout):
+            self._finalize_shot_sequence()
+        
+        # Check each basketball for overlap with hoop
+        if basketball_positions and self.hoop_area and self.hoop_bbox:
+            for ball in detections['basketball']:
+                ball_center = ball['center']
+                ball_bbox = ball['bbox']
+                ball_size = max(ball_bbox[2] - ball_bbox[0], ball_bbox[3] - ball_bbox[1])
+                
+                # Check if ball is in shooting zone
+                in_shooting_zone = (self.hoop_area[0] <= ball_center[0] <= self.hoop_area[2] and 
+                                  self.hoop_area[1] <= ball_center[1] <= self.hoop_area[3])
+                
+                if in_shooting_zone:
+                    # Enhanced ball validation for position and size
+                    size_ratio = ball_size / self.hoop_size
+                    
+                    # Check vertical position relative to hoop
+                    ball_y = ball_center[1]
+                    hoop_y = self.hoop_center[1]
+                    vertical_distance = ball_y - hoop_y
+                    
+                    # Size and position validation based on basketball physics
+                    # Ball should be appropriately sized AND positioned for shot attempts
+                    valid_size = 0.25 <= size_ratio <= 0.85  # Tighter size range
+                    valid_position = vertical_distance <= 100  # Ball shouldn't be too far below hoop
+                    
+                    # Additional check: if ball is below hoop, size should be larger (closer to camera)
+                    if vertical_distance > 50:  # Ball significantly below hoop level
+                        # Floor balls appear smaller, so require larger size ratio
+                        valid_size = size_ratio >= 0.4
+                    elif vertical_distance < -50:  # Ball significantly above hoop
+                        # High balls can be smaller due to distance
+                        valid_size = size_ratio >= 0.2
+                    
+                    if valid_size and valid_position:
+                        
+                        # Check overlap percentage between ball and hoop
+                        overlap_percentage = self._check_box_overlap(ball_bbox, self.hoop_bbox)
+                        self.current_overlap_percentage = overlap_percentage
+                        
+                        # Group overlaps into shot sequences
+                        if overlap_percentage > 0:
+                            if not self.shot_sequence_active:
+                                # Start new shot sequence
+                                self.shot_sequence_active = True
+                                self.shot_sequence_start_time = current_time
+                                self.shot_sequence_overlaps = []
+                                
+                            # Add overlap to current sequence
+                            overlap_data = {
+                                'frame_time': current_time,
+                                'overlap_percentage': overlap_percentage,
+                                'confidence': ball['confidence'],
+                                'ball_position': ball_center,
+                                'size_ratio': size_ratio
+                            }
+                            self.shot_sequence_overlaps.append(overlap_data)
+                            
+        # If no overlaps detected and sequence is active, check for timeout soon
+        else:
+            if (self.shot_sequence_active and 
+                self.shot_sequence_start_time and 
+                current_time - self.shot_sequence_start_time > 1.0):  # 1 second mini-timeout
+                self._finalize_shot_sequence()
+            
+    def _check_box_overlap(self, ball_bbox, hoop_bbox):
+        """Calculate overlap percentage between ball and hoop bounding boxes"""
+        # ball_bbox and hoop_bbox are [x1, y1, x2, y2]
+        ball_x1, ball_y1, ball_x2, ball_y2 = ball_bbox
+        hoop_x1, hoop_y1, hoop_x2, hoop_y2 = hoop_bbox
+        
+        # Calculate intersection area
+        overlap_x = max(0, min(ball_x2, hoop_x2) - max(ball_x1, hoop_x1))
+        overlap_y = max(0, min(ball_y2, hoop_y2) - max(ball_y1, hoop_y1))
+        intersection_area = overlap_x * overlap_y
+        
+        # Calculate ball area
+        ball_area = (ball_x2 - ball_x1) * (ball_y2 - ball_y1)
+        
+        # Return overlap percentage
+        if ball_area > 0:
+            overlap_percentage = (intersection_area / ball_area) * 100
+            return overlap_percentage
+        return 0
+    
+    def _finalize_shot_sequence(self):
+        """Finalize shot sequence and determine single outcome"""
+        if not self.shot_sequence_overlaps:
+            return
+            
+        # Find the maximum overlap percentage in the sequence
+        max_overlap = max(overlap['overlap_percentage'] for overlap in self.shot_sequence_overlaps)
+        
+        # Get the overlap data with maximum percentage
+        max_overlap_data = next(overlap for overlap in self.shot_sequence_overlaps 
+                               if overlap['overlap_percentage'] == max_overlap)
+        
+        # Count frames with 100% overlap for made shot validation
+        frames_with_100_percent = sum(1 for overlap in self.shot_sequence_overlaps 
+                                    if overlap['overlap_percentage'] >= 100.0)
+        
+        # Determine outcome: require 2+ frames of 100% overlap for made shots
+        if max_overlap >= 100.0 and frames_with_100_percent >= 2:
+            outcome = "made"
+            self.stats['made_shots'] += 1
+        else:
+            outcome = "missed"
+            self.stats['missed_shots'] += 1
+            
         self.stats['total_shots'] += 1
         
-        if shot_tracker.outcome == "made":
-            self.stats['made_shots'] += 1
-        elif shot_tracker.outcome == "missed":
-            self.stats['missed_shots'] += 1
-        else:
-            self.stats['undetermined_shots'] += 1
-            
-        # Add to shot log
+        # Log the single shot with comprehensive data
         shot_data = {
-            'shot_id': shot_tracker.shot_id,
+            'frame_time': max_overlap_data['frame_time'],
             'timestamp': datetime.now().isoformat(),
-            'duration': time.time() - shot_tracker.start_time,
-            'outcome': shot_tracker.outcome,
-            'confidence': shot_tracker.confidence,
-            'trajectory_length': len(shot_tracker.trajectory),
-            'trajectory': list(shot_tracker.trajectory)
+            'outcome': outcome,
+            'confidence': max_overlap_data['confidence'],
+            'max_overlap_percentage': max_overlap,
+            'frames_with_100_percent': frames_with_100_percent,
+            'total_overlaps_in_sequence': len(self.shot_sequence_overlaps),
+            'sequence_duration': self.shot_sequence_overlaps[-1]['frame_time'] - self.shot_sequence_overlaps[0]['frame_time'],
+            'ball_position': max_overlap_data['ball_position'],
+            'hoop_center': self.hoop_center,
+            'size_ratio': max_overlap_data['size_ratio'],
+            'detection_method': 'enhanced_sequence'
         }
-        
         self.shot_log.append(shot_data)
         
+        # Reset sequence tracking
+        self.shot_sequence_active = False
+        self.shot_sequence_start_time = None
+        self.shot_sequence_overlaps = []
+        
     def draw_overlay(self, frame, detections):
-        """Draw detection overlay and shot statistics"""
+        """Draw clean detection overlay and shot statistics"""
         height, width = frame.shape[:2]
         overlay = frame.copy()
         
-        # Draw detections
-        for ball in detections['basketball']:
-            x1, y1, x2, y2 = ball['bbox']
-            confidence = ball['confidence']
-            
-            # Draw bounding box
-            cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 165, 255), 2)
-            
-            # Draw label
-            label = f"Ball: {confidence:.2f}"
-            cv2.putText(overlay, label, (x1, y1 - 10), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
-            
-            # Draw center point
-            center = ball['center']
-            cv2.circle(overlay, center, 5, (0, 165, 255), -1)
-            
+        # Draw hoop detection and area
         for hoop in detections['basketball_hoop']:
             x1, y1, x2, y2 = hoop['bbox']
             confidence = hoop['confidence']
             
-            # Draw bounding box
+            # Draw clean hoop box
             cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 255, 0), 2)
             
-            # Draw label
-            label = f"Hoop: {confidence:.2f}"
-            cv2.putText(overlay, label, (x1, y1 - 10), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            # Draw hoop area if defined
+            if self.hoop_area:
+                area_color = (0, 255, 0)
+                cv2.rectangle(overlay, (self.hoop_area[0], self.hoop_area[1]), 
+                            (self.hoop_area[2], self.hoop_area[3]), area_color, 1)
+                
+                # Label the shooting zone
+                cv2.putText(overlay, "SHOOTING ZONE", 
+                          (self.hoop_area[0], self.hoop_area[1] - 10),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, area_color, 1)
             
-        # Draw shot trajectories
-        for shot_tracker in self.active_shots.values():
-            trajectory = list(shot_tracker.trajectory)
-            if len(trajectory) > 1:
-                for i in range(1, len(trajectory)):
-                    cv2.line(overlay, trajectory[i-1], trajectory[i], (255, 255, 0), 2)
+        # Draw basketball detection with fixed color box and confidence
+        for ball in detections['basketball']:
+            x1, y1, x2, y2 = ball['bbox']
+            center = ball['center']
+            confidence = ball['confidence']
+            
+            # Fixed color bounding box for ball (orange)
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 165, 255), 2)
+            
+            # Confidence label on box
+            label = f"Ball: {confidence:.2f}"
+            label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+            cv2.rectangle(overlay, (x1, y1 - label_size[1] - 8), 
+                         (x1 + label_size[0] + 4, y1), (0, 165, 255), -1)
+            cv2.putText(overlay, label, (x1 + 2, y1 - 4), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            
+            # Check if ball is in shooting zone
+            if (self.hoop_area and 
+                self.hoop_area[0] <= center[0] <= self.hoop_area[2] and 
+                self.hoop_area[1] <= center[1] <= self.hoop_area[3]):
+                # Highlight ball in shooting zone with thicker border
+                cv2.rectangle(overlay, (x1, y1), (x2, y2), (255, 255, 0), 3)
+                
+                # Check for box overlap with hoop
+                if self.hoop_bbox:
+                    overlap_pct = self._check_box_overlap(ball['bbox'], self.hoop_bbox)
+                    if overlap_pct > 0:
+                        # Simple color coding: 100% = green (made), anything else = red (missed)
+                        if overlap_pct >= 100.0:
+                            color = (0, 255, 0)  # Green for 100% overlap (made)
+                            label = f"MADE: {overlap_pct:.0f}%"
+                        else:
+                            color = (0, 0, 255)  # Red for partial overlap (missed)
+                            label = f"MISS: {overlap_pct:.0f}%"
+                            
+                        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 4)
+                        cv2.putText(overlay, label, (x1, y2 + 15), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
                     
-        # Draw statistics overlay
-        self._draw_stats_overlay(overlay)
+        # Draw clean statistics overlay
+        self._draw_clean_stats_overlay(overlay)
         
         return overlay
         
-    def _draw_stats_overlay(self, frame):
-        """Draw shot statistics overlay"""
+    def _draw_clean_stats_overlay(self, frame):
+        """Draw clean, minimal shot statistics overlay"""
         height, width = frame.shape[:2]
-        
-        # Create semi-transparent background for stats
-        overlay_bg = np.zeros((120, 300, 3), dtype=np.uint8)
-        overlay_bg[:] = (0, 0, 0)  # Black background
-        
-        # Add transparency
-        alpha = 0.7
-        y_offset = 20
-        x_offset = 20
-        
-        # Draw background rectangle
-        cv2.rectangle(frame, (x_offset, y_offset), 
-                     (x_offset + 300, y_offset + 120), (0, 0, 0), -1)
         
         # Calculate shooting percentage
         total_determined = self.stats['made_shots'] + self.stats['missed_shots']
         shooting_pct = (self.stats['made_shots'] / total_determined * 100) if total_determined > 0 else 0
         
-        # Draw statistics text
-        stats_text = [
-            f"SHOT TRACKER",
-            f"Made: {self.stats['made_shots']}",
-            f"Missed: {self.stats['missed_shots']}",
-            f"Total: {self.stats['total_shots']}",
-            f"Shooting %: {shooting_pct:.1f}%"
-        ]
+        # Position overlay in top-right corner
+        x_offset = width - 200
+        y_offset = 20
         
-        colors = [(255, 255, 255), (0, 255, 0), (0, 0, 255), 
-                 (255, 255, 0), (255, 165, 0)]
+        # Semi-transparent background
+        overlay_bg = np.zeros((80, 180, 3), dtype=np.uint8)
+        alpha = 0.3
         
-        for i, text in enumerate(stats_text):
-            y_pos = y_offset + 25 + (i * 20)
-            cv2.putText(frame, text, (x_offset + 10, y_pos),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, colors[i], 2)
-                       
-        # Show active shots
-        if self.active_shots:
-            active_text = f"Tracking: {len(self.active_shots)} shots"
-            cv2.putText(frame, active_text, (x_offset + 10, y_offset + 140),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        # Create overlay region
+        overlay_region = frame[y_offset:y_offset+80, x_offset:x_offset+180]
+        frame[y_offset:y_offset+80, x_offset:x_offset+180] = cv2.addWeighted(
+            overlay_region, 1-alpha, overlay_bg, alpha, 0)
+        
+        # Clean, minimal text
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.5
+        thickness = 1
+        
+        # Shot statistics
+        cv2.putText(frame, f"MADE: {self.stats['made_shots']}", 
+                   (x_offset + 10, y_offset + 20), font, font_scale, (0, 255, 0), thickness)
+        cv2.putText(frame, f"MISSED: {self.stats['missed_shots']}", 
+                   (x_offset + 10, y_offset + 40), font, font_scale, (0, 100, 255), thickness)
+        cv2.putText(frame, f"TOTAL: {self.stats['total_shots']}", 
+                   (x_offset + 10, y_offset + 60), font, font_scale, (255, 255, 255), thickness)
+        
+        # Show shot sequence tracking info
+        if self.shot_sequence_active:
+            overlaps_count = len(self.shot_sequence_overlaps)
+            max_overlap = max([o['overlap_percentage'] for o in self.shot_sequence_overlaps]) if self.shot_sequence_overlaps else 0
+            frames_100 = sum(1 for o in self.shot_sequence_overlaps if o['overlap_percentage'] >= 100.0)
+            
+            cv2.putText(frame, f"SEQUENCE: {overlaps_count} overlaps", 
+                       (x_offset + 10, y_offset + 80), font, font_scale, (255, 255, 0), thickness)
+            
+            if max_overlap >= 100.0 and frames_100 >= 2:
+                cv2.putText(frame, f"100%: {frames_100} frames - MADE", 
+                           (x_offset + 10, y_offset + 100), font, font_scale, (0, 255, 0), thickness)
+            elif max_overlap >= 100.0:
+                cv2.putText(frame, f"100%: {frames_100} frames - NEED 2+", 
+                           (x_offset + 10, y_offset + 100), font, font_scale, (255, 165, 0), thickness)
+            else:
+                cv2.putText(frame, f"MAX: {max_overlap:.0f}% - MISS", 
+                           (x_offset + 10, y_offset + 100), font, font_scale, (0, 0, 255), thickness)
+        elif self.current_overlap_percentage > 0:
+            if self.current_overlap_percentage >= 100.0:
+                cv2.putText(frame, f"OVERLAP: {self.current_overlap_percentage:.0f}% - MADE", 
+                           (x_offset + 10, y_offset + 80), font, font_scale, (0, 255, 0), thickness)
+            else:
+                cv2.putText(frame, f"OVERLAP: {self.current_overlap_percentage:.0f}% - MISS", 
+                           (x_offset + 10, y_offset + 80), font, font_scale, (0, 0, 255), thickness)
+                   
+    def _draw_stats_overlay(self, frame):
+        """Compatibility method - delegates to clean overlay"""
+        self._draw_clean_stats_overlay(frame)
                        
     def save_session_data(self, filename=None):
         """Save session data to JSON file"""

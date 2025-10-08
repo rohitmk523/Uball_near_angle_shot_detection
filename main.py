@@ -114,7 +114,7 @@ def live_detection(model_path='yolo11n.pt', camera_index=0, save_session=True):
             
     return True
 
-def process_video(video_path, model_path='yolo11n.pt', output_path=None, save_session=True):
+def process_video(video_path, model_path='yolo11n.pt', output_path=None, save_session=True, start_time=None, end_time=None):
     """Process single video file for basketball detection"""
     
     video_path = Path(video_path)
@@ -150,20 +150,51 @@ def process_video(video_path, model_path='yolo11n.pt', output_path=None, save_se
     
     print(f"Video: {width}x{height} @ {fps}fps, {total_frames} frames")
     
+    # Parse time parameters
+    def time_to_seconds(time_str):
+        """Convert HH:MM:SS to seconds"""
+        if not time_str:
+            return None
+        parts = time_str.split(':')
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+        elif len(parts) == 2:
+            return int(parts[0]) * 60 + int(parts[1])
+        else:
+            return int(parts[0])
+    
+    start_seconds = time_to_seconds(start_time) if start_time else 0
+    end_seconds = time_to_seconds(end_time) if end_time else None
+    
+    start_frame = int(start_seconds * fps)
+    end_frame = int(end_seconds * fps) if end_seconds else total_frames
+    
+    # Validate frame range
+    start_frame = max(0, min(start_frame, total_frames - 1))
+    end_frame = max(start_frame + 1, min(end_frame, total_frames))
+    
+    if start_time or end_time:
+        print(f"Processing: {start_time or '00:00:00'} to {end_time or 'end'} (frames {start_frame}-{end_frame})")
+    
+    # Seek to start frame
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    
     # Setup video writer
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
     
-    frame_count = 0
-    start_time = time.time()
+    frame_count = start_frame
+    processing_start_time = time.time()
+    frames_processed = 0
     
     try:
-        while True:
+        while frame_count < end_frame:
             ret, frame = cap.read()
             if not ret:
                 break
                 
             frame_count += 1
+            frames_processed += 1
             
             # Run detection
             detections = analyzer.detect_objects(frame)
@@ -178,11 +209,11 @@ def process_video(video_path, model_path='yolo11n.pt', output_path=None, save_se
             out.write(annotated_frame)
             
             # Progress update
-            if frame_count % 100 == 0:
-                progress = (frame_count / total_frames) * 100
-                elapsed = time.time() - start_time
-                eta = (elapsed / frame_count) * (total_frames - frame_count)
-                print(f"Progress: {progress:.1f}% ({frame_count}/{total_frames}) ETA: {eta:.1f}s")
+            if frames_processed % 100 == 0:
+                progress = (frames_processed / (end_frame - start_frame)) * 100
+                elapsed = time.time() - processing_start_time
+                eta = (elapsed / frames_processed) * ((end_frame - start_frame) - frames_processed) if frames_processed > 0 else 0
+                print(f"Progress: {progress:.1f}% ({frames_processed}/{end_frame - start_frame}) ETA: {eta:.1f}s")
                 
     except KeyboardInterrupt:
         print("\n⚠️ Processing interrupted by user")
@@ -199,10 +230,10 @@ def process_video(video_path, model_path='yolo11n.pt', output_path=None, save_se
             print(f"✓ Session data saved: {session_filename}")
             
         # Print processing summary
-        elapsed_time = time.time() - start_time
+        elapsed_time = time.time() - processing_start_time
         print(f"\n📊 PROCESSING SUMMARY")
-        print(f"Processed: {frame_count} frames in {elapsed_time:.1f}s")
-        print(f"Speed: {frame_count/elapsed_time:.1f} fps")
+        print(f"Processed: {frames_processed} frames in {elapsed_time:.1f}s")
+        print(f"Speed: {frames_processed/elapsed_time:.1f} fps" if elapsed_time > 0 else "Speed: N/A")
         print(f"Total Shots: {analyzer.stats['total_shots']}")
         print(f"Made: {analyzer.stats['made_shots']}")
         print(f"Missed: {analyzer.stats['missed_shots']}")
@@ -306,6 +337,10 @@ def main():
                        help='Output directory for processed videos')
     parser.add_argument('--no_save', action='store_true',
                        help='Do not save session data')
+    parser.add_argument('--start_time', type=str,
+                       help='Start time for video processing (HH:MM:SS or MM:SS or SS)')
+    parser.add_argument('--end_time', type=str,
+                       help='End time for video processing (HH:MM:SS or MM:SS or SS)')
     
     args = parser.parse_args()
     
@@ -323,7 +358,9 @@ def main():
         success = process_video(
             video_path=args.video_path,
             model_path=args.model,
-            save_session=not args.no_save
+            save_session=not args.no_save,
+            start_time=args.start_time,
+            end_time=args.end_time
         )
         
     elif args.action == 'batch':
