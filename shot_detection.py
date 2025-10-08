@@ -149,7 +149,7 @@ class ShotTracker:
 class ShotAnalyzer:
     """Main class for basketball shot detection and analysis"""
     
-    def __init__(self, model_path='yolo11n.pt', confidence_threshold=0.87, min_overlap_threshold=1.0):
+    def __init__(self, model_path='yolo11n.pt', confidence_threshold=0.78, min_overlap_threshold=1.0):
         """Initialize shot analyzer with YOLO model and configurable thresholds"""
         self.model = YOLO(model_path)
         self.model_path = model_path
@@ -187,7 +187,7 @@ class ShotAnalyzer:
         self.current_overlap_percentage = 0
         
         # Configurable thresholds for robustness
-        self.confidence_threshold = confidence_threshold  # Threshold for made vs missed (0.87 default)
+        self.confidence_threshold = confidence_threshold  # Threshold for made vs missed (0.78 default)
         self.min_overlap_threshold = min_overlap_threshold  # Minimum overlap to consider as shot (1.0% default)
         
         # Additional robustness features
