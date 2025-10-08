@@ -297,16 +297,16 @@ class ShotAnalyzer:
                     
                     # Size and position validation based on basketball physics
                     # Ball should be appropriately sized AND positioned for shot attempts
-                    valid_size = 0.25 <= size_ratio <= 0.85  # Tighter size range
+                    valid_size = 0.35 <= size_ratio <= 0.85  # Increased minimum threshold to reduce floor balls
                     valid_position = vertical_distance <= 100  # Ball shouldn't be too far below hoop
                     
                     # Additional check: if ball is below hoop, size should be larger (closer to camera)
                     if vertical_distance > 50:  # Ball significantly below hoop level
                         # Floor balls appear smaller, so require larger size ratio
-                        valid_size = size_ratio >= 0.4
+                        valid_size = size_ratio >= 0.5
                     elif vertical_distance < -50:  # Ball significantly above hoop
                         # High balls can be smaller due to distance
-                        valid_size = size_ratio >= 0.2
+                        valid_size = size_ratio >= 0.3
                     
                     if valid_size and valid_position:
                         
@@ -371,12 +371,12 @@ class ShotAnalyzer:
         max_overlap_data = next(overlap for overlap in self.shot_sequence_overlaps 
                                if overlap['overlap_percentage'] == max_overlap)
         
-        # Count frames with 100% overlap for made shot validation
-        frames_with_100_percent = sum(1 for overlap in self.shot_sequence_overlaps 
-                                    if overlap['overlap_percentage'] >= 100.0)
+        # Count frames with 95% overlap for made shot validation
+        frames_with_95_percent = sum(1 for overlap in self.shot_sequence_overlaps 
+                                   if overlap['overlap_percentage'] >= 95.0)
         
-        # Determine outcome: require 2+ frames of 100% overlap for made shots
-        if max_overlap >= 100.0 and frames_with_100_percent >= 2:
+        # Determine outcome: require 2+ frames of 95% overlap for made shots
+        if max_overlap >= 95.0 and frames_with_95_percent >= 2:
             outcome = "made"
             self.stats['made_shots'] += 1
         else:
@@ -392,7 +392,7 @@ class ShotAnalyzer:
             'outcome': outcome,
             'confidence': max_overlap_data['confidence'],
             'max_overlap_percentage': max_overlap,
-            'frames_with_100_percent': frames_with_100_percent,
+            'frames_with_95_percent': frames_with_95_percent,
             'total_overlaps_in_sequence': len(self.shot_sequence_overlaps),
             'sequence_duration': self.shot_sequence_overlaps[-1]['frame_time'] - self.shot_sequence_overlaps[0]['frame_time'],
             'ball_position': max_overlap_data['ball_position'],
@@ -459,9 +459,9 @@ class ShotAnalyzer:
                 if self.hoop_bbox:
                     overlap_pct = self._check_box_overlap(ball['bbox'], self.hoop_bbox)
                     if overlap_pct > 0:
-                        # Simple color coding: 100% = green (made), anything else = red (missed)
-                        if overlap_pct >= 100.0:
-                            color = (0, 255, 0)  # Green for 100% overlap (made)
+                        # Simple color coding: 95% = green (made), anything else = red (missed)
+                        if overlap_pct >= 95.0:
+                            color = (0, 255, 0)  # Green for 95%+ overlap (made)
                             label = f"MADE: {overlap_pct:.0f}%"
                         else:
                             color = (0, 0, 255)  # Red for partial overlap (missed)
@@ -514,22 +514,22 @@ class ShotAnalyzer:
         if self.shot_sequence_active:
             overlaps_count = len(self.shot_sequence_overlaps)
             max_overlap = max([o['overlap_percentage'] for o in self.shot_sequence_overlaps]) if self.shot_sequence_overlaps else 0
-            frames_100 = sum(1 for o in self.shot_sequence_overlaps if o['overlap_percentage'] >= 100.0)
+            frames_95 = sum(1 for o in self.shot_sequence_overlaps if o['overlap_percentage'] >= 95.0)
             
             cv2.putText(frame, f"SEQUENCE: {overlaps_count} overlaps", 
                        (x_offset + 10, y_offset + 80), font, font_scale, (255, 255, 0), thickness)
             
-            if max_overlap >= 100.0 and frames_100 >= 2:
-                cv2.putText(frame, f"100%: {frames_100} frames - MADE", 
+            if max_overlap >= 95.0 and frames_95 >= 2:
+                cv2.putText(frame, f"95%+: {frames_95} frames - MADE", 
                            (x_offset + 10, y_offset + 100), font, font_scale, (0, 255, 0), thickness)
-            elif max_overlap >= 100.0:
-                cv2.putText(frame, f"100%: {frames_100} frames - NEED 2+", 
+            elif max_overlap >= 95.0:
+                cv2.putText(frame, f"95%+: {frames_95} frames - NEED 2+", 
                            (x_offset + 10, y_offset + 100), font, font_scale, (255, 165, 0), thickness)
             else:
                 cv2.putText(frame, f"MAX: {max_overlap:.0f}% - MISS", 
                            (x_offset + 10, y_offset + 100), font, font_scale, (0, 0, 255), thickness)
         elif self.current_overlap_percentage > 0:
-            if self.current_overlap_percentage >= 100.0:
+            if self.current_overlap_percentage >= 95.0:
                 cv2.putText(frame, f"OVERLAP: {self.current_overlap_percentage:.0f}% - MADE", 
                            (x_offset + 10, y_offset + 80), font, font_scale, (0, 255, 0), thickness)
             else:
