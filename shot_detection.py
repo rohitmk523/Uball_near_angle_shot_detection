@@ -149,8 +149,8 @@ class ShotTracker:
 class ShotAnalyzer:
     """Main class for basketball shot detection and analysis"""
     
-    def __init__(self, model_path='yolo11n.pt'):
-        """Initialize shot analyzer with YOLO model"""
+    def __init__(self, model_path='yolo11n.pt', confidence_threshold=0.87, min_overlap_threshold=1.0):
+        """Initialize shot analyzer with YOLO model and configurable thresholds"""
         self.model = YOLO(model_path)
         self.model_path = model_path
         
@@ -185,6 +185,20 @@ class ShotAnalyzer:
         self.shot_sequence_overlaps = []  # Store all overlaps in current sequence
         self.shot_sequence_timeout = 3.0  # 3 seconds to group overlaps into one shot
         self.current_overlap_percentage = 0
+        
+        # Configurable thresholds for robustness
+        self.confidence_threshold = confidence_threshold  # Threshold for made vs missed (0.87 default)
+        self.min_overlap_threshold = min_overlap_threshold  # Minimum overlap to consider as shot (1.0% default)
+        
+        # Additional robustness features
+        self.recent_shots = []  # Track recent shots to prevent duplicates
+        self.duplicate_prevention_window = 2.0  # seconds
+        self.shot_quality_factors = {
+            'ideal_size_ratio_range': (0.45, 0.65),  # Tighter ideal range
+            'max_vertical_distance': 80,  # More restrictive
+            'sequence_consistency_bonus': 0.03,  # Reduced bonus
+            'min_quality_frames': 3  # Require minimum quality frames
+        }
         
         # Statistics
         self.stats = {
@@ -247,7 +261,7 @@ class ShotAnalyzer:
         return detections
         
     def update_shot_tracking(self, detections):
-        """Simple shot detection: 100% overlap = made, any overlap = missed"""
+        """Enhanced shot detection: 1 frame with 100% overlap = made, otherwise missed"""
         basketball_positions = [ball['center'] for ball in detections['basketball']]
         hoop_positions = [hoop['center'] for hoop in detections['basketball_hoop']]
         
@@ -295,18 +309,23 @@ class ShotAnalyzer:
                     hoop_y = self.hoop_center[1]
                     vertical_distance = ball_y - hoop_y
                     
-                    # Size and position validation based on basketball physics
-                    # Ball should be appropriately sized AND positioned for shot attempts
-                    valid_size = 0.35 <= size_ratio <= 0.85  # Increased minimum threshold to reduce floor balls
-                    valid_position = vertical_distance <= 100  # Ball shouldn't be too far below hoop
+                    # Balanced size and position validation - more selective than before
+                    # Tighten ranges to reduce false positives while still catching legitimate shots
+                    valid_size = 0.35 <= size_ratio <= 0.8  # Tighter range for better accuracy
+                    valid_position = vertical_distance <= 100  # Reasonable position constraint
                     
-                    # Additional check: if ball is below hoop, size should be larger (closer to camera)
-                    if vertical_distance > 50:  # Ball significantly below hoop level
-                        # Floor balls appear smaller, so require larger size ratio
-                        valid_size = size_ratio >= 0.5
-                    elif vertical_distance < -50:  # Ball significantly above hoop
-                        # High balls can be smaller due to distance
-                        valid_size = size_ratio >= 0.3
+                    # More selective validation for different ball positions relative to hoop
+                    if vertical_distance > 40:  # Ball below hoop level
+                        # Require appropriate size for below-rim balls
+                        valid_size = 0.4 <= size_ratio <= 0.8
+                        valid_position = vertical_distance <= 80  # More restrictive for below-rim balls
+                    elif vertical_distance < -40:  # Ball above hoop level
+                        # Balls above rim should be reasonably sized
+                        valid_size = 0.3 <= size_ratio <= 0.7
+                        valid_position = vertical_distance >= -100  # Prevent too-high detections
+                    else:  # Ball near hoop level (-40 to +40 pixels)
+                        # Optimal range for through-basket shots - based on screenshot analysis
+                        valid_size = 0.4 <= size_ratio <= 0.75
                     
                     if valid_size and valid_position:
                         
@@ -314,8 +333,8 @@ class ShotAnalyzer:
                         overlap_percentage = self._check_box_overlap(ball_bbox, self.hoop_bbox)
                         self.current_overlap_percentage = overlap_percentage
                         
-                        # Group overlaps into shot sequences
-                        if overlap_percentage > 0:
+                        # Group overlaps into shot sequences - configurable overlap threshold
+                        if overlap_percentage >= self.min_overlap_threshold:
                             if not self.shot_sequence_active:
                                 # Start new shot sequence
                                 self.shot_sequence_active = True
@@ -359,9 +378,88 @@ class ShotAnalyzer:
             return overlap_percentage
         return 0
     
+    def _calculate_shot_confidence(self, shot_overlaps, max_overlap):
+        """Calculate confidence score based on overlap quality and frame count"""
+        if not shot_overlaps:
+            return 0.0
+            
+        # More conservative base confidence - require higher overlap for high base confidence
+        if max_overlap >= 100.0:
+            base_confidence = 0.7  # Start lower even for perfect overlap
+        elif max_overlap >= 95.0:
+            base_confidence = 0.5
+        elif max_overlap >= 90.0:
+            base_confidence = 0.3
+        else:
+            base_confidence = max_overlap / 100.0 * 0.3  # Very low for <90% overlap
+        
+        # Count frames with different overlap thresholds
+        frames_100_percent = sum(1 for overlap in shot_overlaps if overlap['overlap_percentage'] >= 100.0)
+        frames_95_percent = sum(1 for overlap in shot_overlaps if overlap['overlap_percentage'] >= 95.0)
+        frames_80_percent = sum(1 for overlap in shot_overlaps if overlap['overlap_percentage'] >= 80.0)
+        total_frames = len(shot_overlaps)
+        
+        # Much more demanding confidence bonuses - require exceptional quality for made shots
+        frame_bonus = 0.0
+        if frames_100_percent >= 5:  # Require 5+ perfect frames for highest bonus
+            frame_bonus += 0.15 + (frames_100_percent - 5) * 0.02  # Smaller bonuses
+        elif frames_100_percent >= 3:  # 3-4 perfect frames = good
+            frame_bonus += 0.10
+        elif frames_100_percent >= 2:  # Two perfect frames = moderate
+            frame_bonus += 0.06
+        elif frames_100_percent == 1:  # Single 100% frame = small bonus
+            frame_bonus += 0.03
+            
+        if frames_95_percent >= 6:  # Require many high-overlap frames
+            frame_bonus += 0.08
+        elif frames_95_percent >= 4:  # Some bonus for 4-5 high frames
+            frame_bonus += 0.04
+        elif frames_95_percent >= 2:  # Minimal bonus for 2-3 high frames
+            frame_bonus += 0.02
+            
+        # Sequence quality bonus - much more demanding
+        if total_frames >= 8 and frames_80_percent / total_frames >= 0.8:  # Very demanding
+            frame_bonus += 0.04
+        elif total_frames >= 6 and frames_80_percent / total_frames >= 0.75:
+            frame_bonus += 0.02
+            
+        # Size ratio consistency bonus - very demanding
+        size_ratios = [overlap['size_ratio'] for overlap in shot_overlaps]
+        avg_size_ratio = sum(size_ratios) / len(size_ratios)
+        if 0.5 <= avg_size_ratio <= 0.6:  # Very tight ideal range
+            frame_bonus += 0.05
+        elif 0.45 <= avg_size_ratio <= 0.65:  # Good range
+            frame_bonus += 0.02
+            
+        # Final confidence calculation (cap at 1.0)
+        final_confidence = min(1.0, base_confidence + frame_bonus)
+        return final_confidence
+
+    def _is_duplicate_shot(self, current_time, ball_position):
+        """Check if this shot is a duplicate of a recent shot"""
+        for recent_shot in self.recent_shots:
+            time_diff = current_time - recent_shot['time']
+            if time_diff <= self.duplicate_prevention_window:
+                # Check if ball position is similar to recent shot
+                pos_diff = abs(ball_position[0] - recent_shot['position'][0]) + abs(ball_position[1] - recent_shot['position'][1])
+                if pos_diff < 50:  # Within 50 pixels
+                    return True
+        return False
+
     def _finalize_shot_sequence(self):
-        """Finalize shot sequence and determine single outcome"""
+        """Finalize shot sequence and determine outcome based on confidence threshold"""
         if not self.shot_sequence_overlaps:
+            return
+            
+        # Check for duplicate shots
+        current_time = time.time()
+        max_overlap_position = max(self.shot_sequence_overlaps, key=lambda x: x['overlap_percentage'])['ball_position']
+        
+        if self._is_duplicate_shot(current_time, max_overlap_position):
+            # Reset sequence without logging
+            self.shot_sequence_active = False
+            self.shot_sequence_start_time = None
+            self.shot_sequence_overlaps = []
             return
             
         # Find the maximum overlap percentage in the sequence
@@ -371,12 +469,17 @@ class ShotAnalyzer:
         max_overlap_data = next(overlap for overlap in self.shot_sequence_overlaps 
                                if overlap['overlap_percentage'] == max_overlap)
         
-        # Count frames with 95% overlap for made shot validation
+        # Calculate confidence score for this shot
+        shot_confidence = self._calculate_shot_confidence(self.shot_sequence_overlaps, max_overlap)
+        
+        # Count frames with different overlap thresholds for logging
+        frames_with_100_percent = sum(1 for overlap in self.shot_sequence_overlaps 
+                                    if overlap['overlap_percentage'] >= 100.0)
         frames_with_95_percent = sum(1 for overlap in self.shot_sequence_overlaps 
                                    if overlap['overlap_percentage'] >= 95.0)
         
-        # Determine outcome: require 2+ frames of 95% overlap for made shots
-        if max_overlap >= 95.0 and frames_with_95_percent >= 2:
+        # Confidence-based outcome determination
+        if max_overlap >= 100.0 and shot_confidence >= self.confidence_threshold:
             outcome = "made"
             self.stats['made_shots'] += 1
         else:
@@ -385,22 +488,37 @@ class ShotAnalyzer:
             
         self.stats['total_shots'] += 1
         
-        # Log the single shot with comprehensive data
+        # Log the single shot with comprehensive data including confidence metrics
         shot_data = {
             'frame_time': max_overlap_data['frame_time'],
             'timestamp': datetime.now().isoformat(),
             'outcome': outcome,
-            'confidence': max_overlap_data['confidence'],
+            'confidence': max_overlap_data['confidence'],  # Ball detection confidence
+            'shot_confidence': shot_confidence,  # New: Overall shot confidence score
+            'confidence_threshold': self.confidence_threshold,  # New: Threshold used for decision
             'max_overlap_percentage': max_overlap,
+            'frames_with_100_percent': frames_with_100_percent,  # New: Count of perfect overlap frames
             'frames_with_95_percent': frames_with_95_percent,
             'total_overlaps_in_sequence': len(self.shot_sequence_overlaps),
             'sequence_duration': self.shot_sequence_overlaps[-1]['frame_time'] - self.shot_sequence_overlaps[0]['frame_time'],
             'ball_position': max_overlap_data['ball_position'],
             'hoop_center': self.hoop_center,
             'size_ratio': max_overlap_data['size_ratio'],
-            'detection_method': 'enhanced_sequence'
+            'avg_size_ratio': sum(overlap['size_ratio'] for overlap in self.shot_sequence_overlaps) / len(self.shot_sequence_overlaps),  # New: Average size ratio
+            'detection_method': 'confidence_based_sequence'  # Updated method name
         }
         self.shot_log.append(shot_data)
+        
+        # Add to recent shots for duplicate prevention
+        self.recent_shots.append({
+            'time': current_time,
+            'position': max_overlap_data['ball_position'],
+            'outcome': outcome
+        })
+        
+        # Clean up old recent shots (keep only within duplicate prevention window)
+        self.recent_shots = [shot for shot in self.recent_shots 
+                           if current_time - shot['time'] <= self.duplicate_prevention_window]
         
         # Reset sequence tracking
         self.shot_sequence_active = False
