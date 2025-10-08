@@ -87,8 +87,22 @@ class BasketballTrainer:
         if not self.setup_training_environment():
             return None
             
+        # Auto-detect best device for Mac users
+        if device == 'auto':
+            if torch.backends.mps.is_available():
+                device = 'mps'
+                print("🚀 Using MacBook GPU (MPS) acceleration")
+            elif torch.cuda.is_available():
+                device = 'cuda'
+                print("🚀 Using CUDA GPU acceleration")
+            else:
+                device = 'cpu'
+                print("ℹ️ Using CPU")
+        else:
+            print(f"🔧 Using specified device: {device}")
+            
         print(f"\nStarting YOLOv11{model_size} training...")
-        print(f"Epochs: {epochs}, Batch size: {batch_size}, Image size: {imgsz}")
+        print(f"Epochs: {epochs}, Batch size: {batch_size}, Image size: {imgsz}, Device: {device}")
         
         # Initialize model
         model_name = f'yolo11{model_size}.pt'
@@ -201,8 +215,8 @@ def main():
                        help='Path to model for validation/export')
     parser.add_argument('--export_format', type=str, default='onnx',
                        help='Export format (onnx, torchscript, etc.)')
-    parser.add_argument('--device', type=str, default='cpu',
-                       help='Training device (cpu, cuda, mps, auto)')
+    parser.add_argument('--device', type=str, default='auto',
+                       help='Training device (cpu, cuda, mps, auto) - auto detects best available')
     
     args = parser.parse_args()
     
