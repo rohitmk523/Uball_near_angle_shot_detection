@@ -41,8 +41,8 @@ runs/
 *_detected.*
 *_detections.json
 shot_session_*.json
-*_session.json
 batch_summary.json
+*.json
 
 # IDE
 .vscode/

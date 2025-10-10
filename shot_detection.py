@@ -193,12 +193,6 @@ class ShotAnalyzer:
         # Additional robustness features
         self.recent_shots = []  # Track recent shots to prevent duplicates
         self.duplicate_prevention_window = 2.0  # seconds
-        self.shot_quality_factors = {
-            'ideal_size_ratio_range': (0.45, 0.65),  # Tighter ideal range
-            'max_vertical_distance': 80,  # More restrictive
-            'sequence_consistency_bonus': 0.03,  # Reduced bonus
-            'min_quality_frames': 3  # Require minimum quality frames
-        }
         
         # Statistics
         self.stats = {
@@ -301,33 +295,13 @@ class ShotAnalyzer:
                                   self.hoop_area[1] <= ball_center[1] <= self.hoop_area[3])
                 
                 if in_shooting_zone:
-                    # Enhanced ball validation for position and size
+                    # Basic size validation to filter out false detections
                     size_ratio = ball_size / self.hoop_size
                     
-                    # Check vertical position relative to hoop
-                    ball_y = ball_center[1]
-                    hoop_y = self.hoop_center[1]
-                    vertical_distance = ball_y - hoop_y
+                    # Reasonable size range (not too small, not too large)
+                    valid_size = 0.35 <= size_ratio <= 0.85
                     
-                    # Balanced size and position validation - more selective than before
-                    # Tighten ranges to reduce false positives while still catching legitimate shots
-                    valid_size = 0.35 <= size_ratio <= 0.8  # Tighter range for better accuracy
-                    valid_position = vertical_distance <= 100  # Reasonable position constraint
-                    
-                    # More selective validation for different ball positions relative to hoop
-                    if vertical_distance > 40:  # Ball below hoop level
-                        # Require appropriate size for below-rim balls
-                        valid_size = 0.4 <= size_ratio <= 0.8
-                        valid_position = vertical_distance <= 80  # More restrictive for below-rim balls
-                    elif vertical_distance < -40:  # Ball above hoop level
-                        # Balls above rim should be reasonably sized
-                        valid_size = 0.3 <= size_ratio <= 0.7
-                        valid_position = vertical_distance >= -100  # Prevent too-high detections
-                    else:  # Ball near hoop level (-40 to +40 pixels)
-                        # Optimal range for through-basket shots - based on screenshot analysis
-                        valid_size = 0.4 <= size_ratio <= 0.75
-                    
-                    if valid_size and valid_position:
+                    if valid_size:
                         
                         # Check overlap percentage between ball and hoop
                         overlap_percentage = self._check_box_overlap(ball_bbox, self.hoop_bbox)
@@ -341,12 +315,13 @@ class ShotAnalyzer:
                                 self.shot_sequence_start_time = current_time
                                 self.shot_sequence_overlaps = []
                                 
-                            # Add overlap to current sequence
+                            # Add overlap to current sequence with Y position for rim bounce detection
                             overlap_data = {
                                 'frame_time': current_time,
                                 'overlap_percentage': overlap_percentage,
                                 'confidence': ball['confidence'],
                                 'ball_position': ball_center,
+                                'ball_y': ball_center[1],  # Store Y for upward bounce detection
                                 'size_ratio': size_ratio
                             }
                             self.shot_sequence_overlaps.append(overlap_data)
@@ -469,43 +444,66 @@ class ShotAnalyzer:
         max_overlap_data = next(overlap for overlap in self.shot_sequence_overlaps 
                                if overlap['overlap_percentage'] == max_overlap)
         
-        # Calculate confidence score for this shot
-        shot_confidence = self._calculate_shot_confidence(self.shot_sequence_overlaps, max_overlap)
-        
-        # Count frames with different overlap thresholds for logging
+        # Count frames with different overlap thresholds
         frames_with_100_percent = sum(1 for overlap in self.shot_sequence_overlaps 
                                     if overlap['overlap_percentage'] >= 100.0)
         frames_with_95_percent = sum(1 for overlap in self.shot_sequence_overlaps 
                                    if overlap['overlap_percentage'] >= 95.0)
         
-        # Confidence-based outcome determination
-        if max_overlap >= 100.0 and shot_confidence >= self.confidence_threshold:
+        # Check for rim bounce (ball moving upward)
+        is_rim_bounce = False
+        if len(self.shot_sequence_overlaps) >= 2:
+            first_y = self.shot_sequence_overlaps[0]['ball_y']
+            last_y = self.shot_sequence_overlaps[-1]['ball_y']
+            vertical_movement = last_y - first_y  # Positive = downward, negative = upward
+            
+            if vertical_movement < -10:  # Ball moved up more than 10 pixels = bounce
+                is_rim_bounce = True
+        
+        # === SIMPLIFIED DECISION LOGIC ===
+        # ONLY: Fast swoosh + Rim bounce detection
+        
+        # Check for rim bounce first (overrides everything)
+        if is_rim_bounce:
+            outcome = "missed"
+            outcome_reason = "rim_bounce_detected"
+        # Standard made shot: 2+ frames at 100% overlap
+        elif frames_with_100_percent >= 2:
             outcome = "made"
-            self.stats['made_shots'] += 1
+            outcome_reason = "perfect_overlap"
+        # Fast swoosh: 3+ frames at 95%+ overlap
+        elif frames_with_95_percent >= 3:
+            outcome = "made"
+            outcome_reason = "fast_swoosh"
+        # Everything else is missed
         else:
             outcome = "missed"
+            outcome_reason = "insufficient_overlap"
+        
+        # Update statistics
+        if outcome == "made":
+            self.stats['made_shots'] += 1
+        else:
             self.stats['missed_shots'] += 1
             
         self.stats['total_shots'] += 1
         
-        # Log the single shot with comprehensive data including confidence metrics
+        # Log the shot with simplified data
         shot_data = {
             'frame_time': max_overlap_data['frame_time'],
             'timestamp': datetime.now().isoformat(),
             'outcome': outcome,
-            'confidence': max_overlap_data['confidence'],  # Ball detection confidence
-            'shot_confidence': shot_confidence,  # New: Overall shot confidence score
-            'confidence_threshold': self.confidence_threshold,  # New: Threshold used for decision
+            'outcome_reason': outcome_reason,
+            'confidence': max_overlap_data['confidence'],
             'max_overlap_percentage': max_overlap,
-            'frames_with_100_percent': frames_with_100_percent,  # New: Count of perfect overlap frames
+            'frames_with_100_percent': frames_with_100_percent,
             'frames_with_95_percent': frames_with_95_percent,
             'total_overlaps_in_sequence': len(self.shot_sequence_overlaps),
             'sequence_duration': self.shot_sequence_overlaps[-1]['frame_time'] - self.shot_sequence_overlaps[0]['frame_time'],
             'ball_position': max_overlap_data['ball_position'],
             'hoop_center': self.hoop_center,
-            'size_ratio': max_overlap_data['size_ratio'],
-            'avg_size_ratio': sum(overlap['size_ratio'] for overlap in self.shot_sequence_overlaps) / len(self.shot_sequence_overlaps),  # New: Average size ratio
-            'detection_method': 'confidence_based_sequence'  # Updated method name
+            'is_rim_bounce': is_rim_bounce,
+            'detection_method': 'simple_fast_swoosh_rim_bounce'
         }
         self.shot_log.append(shot_data)
         
