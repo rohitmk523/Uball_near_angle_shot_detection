@@ -463,19 +463,28 @@ class ShotAnalyzer:
         # === SIMPLIFIED DECISION LOGIC ===
         # ONLY: Fast swoosh + Rim bounce detection
         
-        # Check for rim bounce first (overrides everything)
-        if is_rim_bounce:
+        # Priority 1: High overlap frames override rim bounce (layups)
+        # If ball goes through hoop with many perfect frames, it's made regardless of motion
+        if frames_with_100_percent >= 5:
+            outcome = "made"
+            outcome_reason = "perfect_overlap_layup"
+        
+        # Priority 2: Check for rim bounce (low overlap bounces)
+        elif is_rim_bounce and frames_with_100_percent < 2:
             outcome = "missed"
             outcome_reason = "rim_bounce_detected"
-        # Standard made shot: 2+ frames at 100% overlap
+        
+        # Priority 3: Standard made shot: 2+ frames at 100% overlap
         elif frames_with_100_percent >= 2:
             outcome = "made"
             outcome_reason = "perfect_overlap"
-        # Fast swoosh: 3+ frames at 95%+ overlap
+        
+        # Priority 4: Fast swoosh: 3+ frames at 95%+ overlap
         elif frames_with_95_percent >= 3:
             outcome = "made"
             outcome_reason = "fast_swoosh"
-        # Everything else is missed
+        
+        # Priority 5: Everything else is missed
         else:
             outcome = "missed"
             outcome_reason = "insufficient_overlap"
