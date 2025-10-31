@@ -17,8 +17,9 @@ import time
 from pathlib import Path
 import json
 from shot_detection import ShotAnalyzer
+from accuracy_validator import AccuracyValidator
 
-def live_detection(model_path='yolo11n.pt', camera_index=0, save_session=True):
+def live_detection(model_path='runs/detect/basketball_yolo11n3/weights/best.pt', camera_index=0, save_session=True):
     """Run live basketball detection from camera feed"""
     
     print("="*60)
@@ -43,6 +44,10 @@ def live_detection(model_path='yolo11n.pt', camera_index=0, save_session=True):
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     cap.set(cv2.CAP_PROP_FPS, 30)
     
+    # Set up frame-based timing for live detection
+    camera_fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    analyzer.set_video_timing(camera_fps, 0)
+    
     print("🏀 Starting live detection... Press 'q' to quit")
     
     frame_count = 0
@@ -56,6 +61,9 @@ def live_detection(model_path='yolo11n.pt', camera_index=0, save_session=True):
                 break
                 
             frame_count += 1
+            
+            # Update frame number for timestamp calculation
+            analyzer.update_frame_number(frame_count)
             
             # Run detection
             detections = analyzer.detect_objects(frame)
@@ -114,7 +122,7 @@ def live_detection(model_path='yolo11n.pt', camera_index=0, save_session=True):
             
     return True
 
-def process_video(video_path, model_path='yolo11n.pt', output_path=None, save_session=True, start_time=None, end_time=None):
+def process_video(video_path, model_path='runs/detect/basketball_yolo11n3/weights/best.pt', output_path=None, save_session=True, start_time=None, end_time=None, game_id=None, validate_accuracy=False, angle=None):
     """Process single video file for basketball detection"""
     
     video_path = Path(video_path)
@@ -142,8 +150,8 @@ def process_video(video_path, model_path='yolo11n.pt', output_path=None, save_se
         print(f"❌ Failed to open video: {video_path}")
         return False
         
-    # Get video properties
-    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    # Get video properties (keep FPS as float for accuracy, cap to 2 decimal places)
+    fps = round(cap.get(cv2.CAP_PROP_FPS), 2)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -169,6 +177,9 @@ def process_video(video_path, model_path='yolo11n.pt', output_path=None, save_se
     start_frame = int(start_seconds * fps)
     end_frame = int(end_seconds * fps) if end_seconds else total_frames
     
+    # Set video timing for frame-based timestamps
+    analyzer.set_video_timing(fps, start_frame)
+    
     # Validate frame range
     start_frame = max(0, min(start_frame, total_frames - 1))
     end_frame = max(start_frame + 1, min(end_frame, total_frames))
@@ -179,7 +190,7 @@ def process_video(video_path, model_path='yolo11n.pt', output_path=None, save_se
     # Seek to start frame
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
     
-    # Setup video writer
+    # Setup video writer (use same FPS as input for consistency)
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
     
@@ -195,6 +206,9 @@ def process_video(video_path, model_path='yolo11n.pt', output_path=None, save_se
                 
             frame_count += 1
             frames_processed += 1
+            
+            # Update frame number for timestamp calculation
+            analyzer.update_frame_number(frame_count)
             
             # Run detection
             detections = analyzer.detect_objects(frame)
@@ -224,10 +238,58 @@ def process_video(video_path, model_path='yolo11n.pt', output_path=None, save_se
         out.release()
         
         # Save session data
+        session_filename = None
         if save_session:
             session_filename = video_path.stem + "_session.json"
             analyzer.save_session_data(session_filename)
             print(f"✓ Session data saved: {session_filename}")
+            
+        # Validate accuracy if requested
+        if validate_accuracy and game_id and session_filename:
+            print(f"\n🔍 VALIDATING ACCURACY")
+            print(f"Game ID: {game_id}")
+            
+            # Convert time parameters to seconds for validation
+            def time_to_seconds(time_str):
+                if not time_str:
+                    return None
+                parts = time_str.split(':')
+                if len(parts) == 3:
+                    return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+                elif len(parts) == 2:
+                    return int(parts[0]) * 60 + int(parts[1])
+                else:
+                    return int(parts[0])
+            
+            validation_start_seconds = time_to_seconds(start_time) if start_time else None
+            validation_end_seconds = time_to_seconds(end_time) if end_time else None
+            
+            if validation_start_seconds is not None or validation_end_seconds is not None:
+                print(f"Time range: {start_time or '00:00:00'} to {end_time or 'end'}")
+            
+            try:
+                validator = AccuracyValidator()
+                validation_result = validator.validate_detection(
+                    game_id=game_id,
+                    detection_json_path=session_filename,
+                    video_path=str(video_path),
+                    processed_video_path=str(output_path),
+                    start_seconds=validation_start_seconds,
+                    end_seconds=validation_end_seconds,
+                    angle=angle
+                )
+                
+                if validation_result.get('success'):
+                    print(f"✅ Accuracy validation completed!")
+                    print(f"📁 Results saved to: {validation_result['session_dir']}")
+                    print(f"📊 Accuracy Summary:")
+                    for key, value in validation_result['quick_stats'].items():
+                        print(f"   {key}: {value}")
+                else:
+                    print(f"❌ Accuracy validation failed: {validation_result.get('error', 'Unknown error')}")
+                    
+            except Exception as e:
+                print(f"⚠️ Accuracy validation error: {e}")
             
         # Print processing summary
         elapsed_time = time.time() - processing_start_time
@@ -241,7 +303,7 @@ def process_video(video_path, model_path='yolo11n.pt', output_path=None, save_se
         
     return True
 
-def batch_process(video_dir, model_path='yolo11n.pt', output_dir=None):
+def batch_process(video_dir, model_path='runs/detect/basketball_yolo11n3/weights/best.pt', output_dir=None):
     """Process multiple videos in batch"""
     
     video_dir = Path(video_dir)
@@ -325,7 +387,7 @@ def main():
     parser.add_argument('--action', type=str, required=True,
                        choices=['live', 'video', 'batch'],
                        help='Action to perform')
-    parser.add_argument('--model', type=str, default='yolo11n.pt',
+    parser.add_argument('--model', type=str, default='runs/detect/basketball_yolo11n3/weights/best.pt',
                        help='Path to YOLO model')
     parser.add_argument('--camera', type=int, default=0,
                        help='Camera index for live detection')
@@ -341,6 +403,12 @@ def main():
                        help='Start time for video processing (HH:MM:SS or MM:SS or SS)')
     parser.add_argument('--end_time', type=str,
                        help='End time for video processing (HH:MM:SS or MM:SS or SS)')
+    parser.add_argument('--game_id', type=str,
+                       help='Game ID for accuracy validation against Supabase data')
+    parser.add_argument('--validate_accuracy', action='store_true',
+                       help='Validate accuracy against ground truth data from Supabase')
+    parser.add_argument('--angle', type=str, choices=['LEFT', 'RIGHT'],
+                       help='Filter ground truth by shooting angle (LEFT or RIGHT)')
     
     args = parser.parse_args()
     
@@ -360,7 +428,10 @@ def main():
             model_path=args.model,
             save_session=not args.no_save,
             start_time=args.start_time,
-            end_time=args.end_time
+            end_time=args.end_time,
+            game_id=args.game_id,
+            validate_accuracy=args.validate_accuracy,
+            angle=args.angle
         )
         
     elif args.action == 'batch':

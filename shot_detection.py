@@ -20,8 +20,19 @@ import time
 from datetime import datetime
 from pathlib import Path
 from collections import deque
-from ultralytics import YOLO
 import math
+from scipy.ndimage import gaussian_filter1d
+from filterpy.kalman import KalmanFilter
+
+# Fix for PyTorch 2.6+ weights_only security change
+import torch
+try:
+    from ultralytics.nn.tasks import DetectionModel
+    torch.serialization.add_safe_globals([DetectionModel])
+except (AttributeError, ImportError):
+    pass
+
+from ultralytics import YOLO
 
 class ShotTracker:
     """Tracks individual shot trajectories and determines outcomes"""
@@ -149,7 +160,7 @@ class ShotTracker:
 class ShotAnalyzer:
     """Main class for basketball shot detection and analysis"""
     
-    def __init__(self, model_path='yolo11n.pt', confidence_threshold=0.78, min_overlap_threshold=1.0):
+    def __init__(self, model_path='runs/detect/basketball_yolo11n3/weights/best.pt', confidence_threshold=0.78, min_overlap_threshold=1.0):
         """Initialize shot analyzer with YOLO model and configurable thresholds"""
         self.model = YOLO(model_path)
         self.model_path = model_path
@@ -186,6 +197,14 @@ class ShotAnalyzer:
         self.shot_sequence_timeout = 3.0  # 3 seconds to group overlaps into one shot
         self.current_overlap_percentage = 0
         
+        # Enhanced trajectory tracking
+        self.ball_trajectory_buffer = deque(maxlen=60)  # Store 2 seconds of ball positions at 30fps
+        self.pre_hoop_trajectory = []  # Trajectory before hoop interaction
+        self.post_hoop_trajectory = []  # Trajectory after hoop interaction
+        self.post_hoop_tracking_frames = 0
+        self.post_hoop_tracking_active = False
+        self.post_hoop_max_frames = 20  # Track for 20 frames after overlap ends
+        
         # Configurable thresholds for robustness
         self.confidence_threshold = confidence_threshold  # Threshold for made vs missed (0.78 default)
         self.min_overlap_threshold = min_overlap_threshold  # Minimum overlap to consider as shot (1.0% default)
@@ -205,6 +224,26 @@ class ShotAnalyzer:
         # Logging
         self.shot_log = []
         self.session_start = datetime.now()
+        
+        # Simple video timing (frame-based)
+        self.video_fps = None
+        self.current_frame_number = 0
+        
+    def set_video_timing(self, fps, start_frame=0):
+        """Set video timing parameters for frame-based timestamps"""
+        self.video_fps = fps
+        self.current_frame_number = start_frame
+            
+    def update_frame_number(self, frame_number):
+        """Update current frame number for timestamp calculation"""
+        self.current_frame_number = frame_number
+        
+    def get_video_timestamp_seconds(self):
+        """Calculate current video timestamp in seconds"""
+        if self.video_fps is not None:
+            return self.current_frame_number / self.video_fps
+        else:
+            return 0.0
         
     def detect_objects(self, frame):
         """Detect basketball and hoop in frame"""
@@ -317,7 +356,6 @@ class ShotAnalyzer:
                                 
                             # Add overlap to current sequence with Y position for rim bounce detection
                             overlap_data = {
-                                'frame_time': current_time,
                                 'overlap_percentage': overlap_percentage,
                                 'confidence': ball['confidence'],
                                 'ball_position': ball_center,
@@ -420,9 +458,122 @@ class ShotAnalyzer:
                 if pos_diff < 50:  # Within 50 pixels
                     return True
         return False
+    
+    def _calculate_entry_angle(self, trajectory_points, hoop_center):
+        """Calculate ball entry angle relative to hoop (vertical = 90°, horizontal = 0°)"""
+        if len(trajectory_points) < 3:
+            return None
+            
+        # Get last few points before hoop
+        recent_points = trajectory_points[-5:] if len(trajectory_points) >= 5 else trajectory_points
+        
+        if len(recent_points) < 2:
+            return None
+            
+        # Calculate velocity vector (direction of ball movement)
+        first_point = recent_points[0]['ball_position']
+        last_point = recent_points[-1]['ball_position']
+        
+        dx = last_point[0] - first_point[0]
+        dy = last_point[1] - first_point[1]  # Positive = downward
+        
+        # Calculate angle from horizontal (0° = horizontal, 90° = straight down)
+        if dx == 0:
+            angle = 90.0 if dy > 0 else -90.0
+        else:
+            angle_rad = math.atan2(dy, abs(dx))
+            angle = math.degrees(angle_rad)
+            
+        # Normalize to 0-90° range (we care about steepness, not direction)
+        angle = abs(angle)
+        
+        return angle
+    
+    def _analyze_post_hoop_trajectory(self, overlap_frames):
+        """Analyze ball behavior after hoop interaction"""
+        if not overlap_frames or len(overlap_frames) < 2:
+            return {
+                'ball_continues_down': False,
+                'ball_bounces_back': False,
+                'ball_disappears': False,
+                'confidence': 0.0
+            }
+        
+        # Get Y positions throughout the overlap sequence
+        y_positions = [frame['ball_y'] for frame in overlap_frames]
+        
+        # Analyze trend
+        first_y = y_positions[0]
+        last_y = y_positions[-1]
+        
+        # Check for consistent downward movement (made shot)
+        downward_movement = last_y - first_y
+        
+        # Check for upward bounce (missed shot - rim bounce)
+        upward_movement = first_y - last_y
+        
+        # Calculate velocity consistency
+        if len(y_positions) >= 3:
+            # Check if movement is consistently in one direction
+            deltas = [y_positions[i+1] - y_positions[i] for i in range(len(y_positions)-1)]
+            positive_deltas = sum(1 for d in deltas if d > 2)  # Downward
+            negative_deltas = sum(1 for d in deltas if d < -2)  # Upward
+            
+            total_deltas = len(deltas)
+            downward_consistency = positive_deltas / total_deltas if total_deltas > 0 else 0
+            upward_consistency = negative_deltas / total_deltas if total_deltas > 0 else 0
+        else:
+            downward_consistency = 0.5
+            upward_consistency = 0.5
+        
+        return {
+            'ball_continues_down': downward_movement > 15 and downward_consistency > 0.6,
+            'ball_bounces_back': upward_movement > 15 and upward_consistency > 0.5,
+            'downward_movement': downward_movement,
+            'upward_movement': upward_movement,
+            'downward_consistency': downward_consistency,
+            'upward_consistency': upward_consistency
+        }
+    
+    def _enhanced_rim_bounce_detection(self, overlap_frames, entry_angle, post_hoop_analysis):
+        """Multi-factor rim bounce detection"""
+        if not overlap_frames:
+            return False, 0.0
+        
+        bounce_score = 0.0
+        max_score = 5.0
+        
+        # Factor 1: Upward movement during overlap (strongest indicator)
+        if post_hoop_analysis.get('ball_bounces_back', False):
+            bounce_score += 2.0
+        
+        # Factor 2: Low entry angle (ball approaching from side)
+        if entry_angle is not None and entry_angle < 35:  # Less than 35° from horizontal
+            bounce_score += 1.5
+        
+        # Factor 3: Low overlap percentage (grazing the rim)
+        max_overlap = max(f['overlap_percentage'] for f in overlap_frames)
+        if max_overlap < 80:
+            bounce_score += 1.0
+        elif max_overlap < 95:
+            bounce_score += 0.5
+        
+        # Factor 4: Erratic movement pattern
+        if len(overlap_frames) >= 3:
+            overlaps = [f['overlap_percentage'] for f in overlap_frames]
+            # Check for sudden drops in overlap (ball bouncing off)
+            drops = sum(1 for i in range(len(overlaps)-1) if overlaps[i] - overlaps[i+1] > 30)
+            if drops >= 2:
+                bounce_score += 0.5
+        
+        # Determine if it's a rim bounce
+        is_bounce = bounce_score >= 2.5
+        confidence = bounce_score / max_score
+        
+        return is_bounce, confidence
 
     def _finalize_shot_sequence(self):
-        """Finalize shot sequence and determine outcome based on confidence threshold"""
+        """Enhanced shot sequence finalization with multi-factor analysis"""
         if not self.shot_sequence_overlaps:
             return
             
@@ -437,10 +588,12 @@ class ShotAnalyzer:
             self.shot_sequence_overlaps = []
             return
             
-        # Find the maximum overlap percentage in the sequence
-        max_overlap = max(overlap['overlap_percentage'] for overlap in self.shot_sequence_overlaps)
+        # === ENHANCED ANALYSIS ===
         
-        # Get the overlap data with maximum percentage
+        # Calculate overlap statistics
+        max_overlap = max(overlap['overlap_percentage'] for overlap in self.shot_sequence_overlaps)
+        avg_overlap = sum(overlap['overlap_percentage'] for overlap in self.shot_sequence_overlaps) / len(self.shot_sequence_overlaps)
+        
         max_overlap_data = next(overlap for overlap in self.shot_sequence_overlaps 
                                if overlap['overlap_percentage'] == max_overlap)
         
@@ -449,45 +602,159 @@ class ShotAnalyzer:
                                     if overlap['overlap_percentage'] >= 100.0)
         frames_with_95_percent = sum(1 for overlap in self.shot_sequence_overlaps 
                                    if overlap['overlap_percentage'] >= 95.0)
+        frames_with_90_percent = sum(1 for overlap in self.shot_sequence_overlaps 
+                                   if overlap['overlap_percentage'] >= 90.0)
         
-        # Check for rim bounce (ball moving upward)
-        is_rim_bounce = False
-        if len(self.shot_sequence_overlaps) >= 2:
-            first_y = self.shot_sequence_overlaps[0]['ball_y']
-            last_y = self.shot_sequence_overlaps[-1]['ball_y']
-            vertical_movement = last_y - first_y  # Positive = downward, negative = upward
-            
-            if vertical_movement < -10:  # Ball moved up more than 10 pixels = bounce
-                is_rim_bounce = True
+        total_overlap_frames = len(self.shot_sequence_overlaps)
         
-        # === SIMPLIFIED DECISION LOGIC ===
-        # ONLY: Fast swoosh + Rim bounce detection
+        # Calculate entry angle
+        entry_angle = self._calculate_entry_angle(self.shot_sequence_overlaps, self.hoop_center)
         
-        # Priority 1: High overlap frames override rim bounce (layups)
-        # If ball goes through hoop with many perfect frames, it's made regardless of motion
-        if frames_with_100_percent >= 5:
-            outcome = "made"
-            outcome_reason = "perfect_overlap_layup"
+        # Analyze post-hoop trajectory
+        post_hoop_analysis = self._analyze_post_hoop_trajectory(self.shot_sequence_overlaps)
         
-        # Priority 2: Check for rim bounce (low overlap bounces)
-        elif is_rim_bounce and frames_with_100_percent < 2:
+        # Enhanced rim bounce detection
+        is_rim_bounce, bounce_confidence = self._enhanced_rim_bounce_detection(
+            self.shot_sequence_overlaps, 
+            entry_angle, 
+            post_hoop_analysis
+        )
+        
+        # Calculate weighted overlap score (addresses fast shot blind spot)
+        weighted_overlap_score = (
+            frames_with_100_percent * 1.0 +
+            (frames_with_95_percent - frames_with_100_percent) * 0.8 +
+            (frames_with_90_percent - frames_with_95_percent) * 0.5
+        )
+        
+        # === ENHANCED DECISION LOGIC V3 ===
+        # Physics-based improvements from misclassification analysis
+        
+        outcome = "missed"  # Default
+        outcome_reason = "insufficient_evidence"
+        decision_confidence = 0.0
+        
+        # FIX 1: Enhanced Rim Bounce for Steep Entries
+        # Physics: Made shots with steep entry (>70°) should NOT bounce upward
+        steep_entry_bounce_back = (
+            entry_angle is not None and entry_angle >= 70 and 
+            post_hoop_analysis['ball_bounces_back']
+        )
+        
+        # Decision Factor 1: Very High Overlap (Certain Made Shots)
+        # Requires minimum 4+ frames at 100% OR 7+ frames at 95%+ to be confident
+        if frames_with_100_percent >= 6 or (frames_with_100_percent >= 4 and frames_with_95_percent >= 7):
+            # Check for rim bounce override (including steep entry bounce-back)
+            if steep_entry_bounce_back:
+                # FIX 1: Steep entries that bounce back are rim bounces
+                outcome = "missed"
+                outcome_reason = "steep_entry_bounce_back"
+                decision_confidence = 0.85
+            elif is_rim_bounce and bounce_confidence > 0.7 and not post_hoop_analysis['ball_continues_down']:
+                outcome = "missed"
+                outcome_reason = "rim_bounce_high_confidence"
+                decision_confidence = bounce_confidence
+            else:
+                outcome = "made"
+                outcome_reason = "perfect_overlap_layup"
+                decision_confidence = 0.95
+        
+        # Decision Factor 2: Strong Rim Bounce Indicators (Certain Missed Shots)
+        elif steep_entry_bounce_back:
+            # FIX 1: Steep entry bounce-back is a clear miss
+            outcome = "missed"
+            outcome_reason = "steep_entry_bounce_back"
+            decision_confidence = 0.85
+        elif is_rim_bounce and bounce_confidence >= 0.6:
             outcome = "missed"
             outcome_reason = "rim_bounce_detected"
+            decision_confidence = bounce_confidence
         
-        # Priority 3: Standard made shot: 2+ frames at 100% overlap
-        elif frames_with_100_percent >= 2:
-            outcome = "made"
-            outcome_reason = "perfect_overlap"
+        # Decision Factor 3: Good Overlap + Positive Indicators (Made Shots)
+        # Includes 3+ frames at 100%
+        elif frames_with_100_percent >= 3 and not is_rim_bounce:
+            # FIX 2: Enhanced downward continuation weight
+            downward_consistency = post_hoop_analysis.get('downward_consistency', 0)
+            
+            # Additional checks for confidence
+            if entry_angle is not None and entry_angle >= 40:  # Steep entry
+                outcome = "made"
+                outcome_reason = "perfect_overlap_steep_entry"
+                decision_confidence = 0.85
+            elif post_hoop_analysis['ball_continues_down'] and downward_consistency >= 0.8:
+                # FIX 2: Strong downward continuation = higher confidence
+                outcome = "made"
+                outcome_reason = "perfect_overlap_continues_down_strong"
+                decision_confidence = 0.88
+            elif post_hoop_analysis['ball_continues_down']:
+                outcome = "made"
+                outcome_reason = "perfect_overlap_continues_down"
+                decision_confidence = 0.82
+            else:
+                outcome = "made"
+                outcome_reason = "perfect_overlap"
+                decision_confidence = 0.75
         
-        # Priority 4: Fast swoosh: 3+ frames at 95%+ overlap
-        elif frames_with_95_percent >= 3:
-            outcome = "made"
-            outcome_reason = "fast_swoosh"
+        # Decision Factor 3b: Fast Clean Swish (NEW - FIX 3)
+        # 2 frames at 100% with strong downward continuation
+        elif frames_with_100_percent >= 2 and not is_rim_bounce:
+            downward_consistency = post_hoop_analysis.get('downward_consistency', 0)
+            
+            # FIX 3: Allow 2 frames if downward continuation is very strong
+            if post_hoop_analysis['ball_continues_down'] and downward_consistency >= 0.8:
+                outcome = "made"
+                outcome_reason = "fast_clean_swish"
+                decision_confidence = 0.75
+            else:
+                # Not enough evidence with only 2 frames and weak downward
+                outcome = "missed"
+                outcome_reason = "insufficient_overlap"
+                decision_confidence = 0.65
         
-        # Priority 5: Everything else is missed
+        # Decision Factor 4: Fast Clean Swish (Weighted Score System)
+        # Addresses blind spot for very fast shots
+        elif weighted_overlap_score >= 3.5 and not is_rim_bounce:
+            downward_consistency = post_hoop_analysis.get('downward_consistency', 0)
+            
+            # FIX 2: Enhanced downward weight for fast shots
+            if post_hoop_analysis['ball_continues_down'] and downward_consistency >= 0.8:
+                # Very strong downward = likely made
+                outcome = "made"
+                outcome_reason = "fast_swoosh_clean_strong"
+                decision_confidence = 0.75
+            elif (entry_angle is not None and entry_angle >= 35) or post_hoop_analysis['ball_continues_down']:
+                outcome = "made"
+                outcome_reason = "fast_swoosh_clean"
+                decision_confidence = 0.70
+            else:
+                # Ambiguous fast shot - need more evidence
+                outcome = "missed"
+                outcome_reason = "fast_swoosh_ambiguous"
+                decision_confidence = 0.55
+        
+        # Decision Factor 5: Moderate Overlap (Ambiguous Cases)
+        elif frames_with_95_percent >= 4 and avg_overlap >= 85:
+            downward_consistency = post_hoop_analysis.get('downward_consistency', 0)
+            
+            # FIX 2: Use downward consistency for tiebreaker
+            if post_hoop_analysis['ball_continues_down'] and downward_consistency >= 0.8:
+                outcome = "made"
+                outcome_reason = "moderate_overlap_strong_downward"
+                decision_confidence = 0.70
+            elif entry_angle is not None and entry_angle >= 45 and post_hoop_analysis['ball_continues_down']:
+                outcome = "made"
+                outcome_reason = "moderate_overlap_good_indicators"
+                decision_confidence = 0.65
+            else:
+                outcome = "missed"
+                outcome_reason = "moderate_overlap_insufficient"
+                decision_confidence = 0.60
+        
+        # Decision Factor 6: Low Overlap (Missed Shots)
         else:
             outcome = "missed"
             outcome_reason = "insufficient_overlap"
+            decision_confidence = 0.80
         
         # Update statistics
         if outcome == "made":
@@ -497,22 +764,27 @@ class ShotAnalyzer:
             
         self.stats['total_shots'] += 1
         
-        # Log the shot with simplified data
+        # Log the shot with enhanced analysis data
         shot_data = {
-            'frame_time': max_overlap_data['frame_time'],
-            'timestamp': datetime.now().isoformat(),
+            'timestamp_seconds': self.get_video_timestamp_seconds(),
             'outcome': outcome,
             'outcome_reason': outcome_reason,
-            'confidence': max_overlap_data['confidence'],
+            'decision_confidence': decision_confidence,
+            'detection_confidence': max_overlap_data['confidence'],
             'max_overlap_percentage': max_overlap,
+            'avg_overlap_percentage': avg_overlap,
             'frames_with_100_percent': frames_with_100_percent,
             'frames_with_95_percent': frames_with_95_percent,
+            'frames_with_90_percent': frames_with_90_percent,
+            'weighted_overlap_score': weighted_overlap_score,
             'total_overlaps_in_sequence': len(self.shot_sequence_overlaps),
-            'sequence_duration': self.shot_sequence_overlaps[-1]['frame_time'] - self.shot_sequence_overlaps[0]['frame_time'],
             'ball_position': max_overlap_data['ball_position'],
             'hoop_center': self.hoop_center,
             'is_rim_bounce': is_rim_bounce,
-            'detection_method': 'simple_fast_swoosh_rim_bounce'
+            'rim_bounce_confidence': bounce_confidence,
+            'entry_angle': entry_angle,
+            'post_hoop_analysis': post_hoop_analysis,
+            'detection_method': 'enhanced_multi_factor_v3'
         }
         self.shot_log.append(shot_data)
         

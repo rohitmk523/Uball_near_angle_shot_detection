@@ -35,14 +35,16 @@ MANIFEST
 # Outputs
 basketball_dataset/
 runs/
+results/
 *.mp4
 *.avi
 *.mov
 *_detected.*
+*_session*.json
 *_detections.json
-shot_session_*.json
 batch_summary.json
-*.json
+input/*_detected.*
+input/*_session*.json
 
 # IDE
 .vscode/
@@ -58,4 +60,4 @@ Thumbs.db
 .ipynb_checkpoints/
 
 # Logs
-*.log
+*.loginput/

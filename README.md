@@ -1,20 +1,21 @@
 # Basketball Shot Detection System
 
-A comprehensive basketball shot detection system using YOLOv11 for object detection and advanced trajectory analysis for shot outcome classification.
+A comprehensive basketball shot detection system using YOLOv11 for object detection and enhanced multi-factor analysis for shot outcome classification.
 
 ## Features
 
-- **Zero-shot Detection**: Test basketball detection using pre-trained YOLO models
-- **Custom Training**: Train specialized models for basketball and hoop detection
-- **Shot Tracking**: Advanced trajectory analysis for shot detection
-- **Made/Missed Classification**: Automated shot outcome determination with confidence scores
-- **Real-time Processing**: Live camera feed analysis
-- **Batch Processing**: Process multiple videos efficiently
-- **Performance Evaluation**: Comprehensive metrics and benchmarking
+- **Enhanced Shot Detection**: Multi-factor analysis combining overlap, trajectory, and physics-based indicators
+- **Accuracy Validation**: Automated ground truth comparison with detailed mismatch analysis
+- **Multi-Camera Ready**: Architecture supports synced dual-camera analysis
+- **Post-Processing Optimized**: Designed for batch video processing, not real-time
+- **Made/Missed Classification**: Advanced decision logic with confidence scoring
+- **Rim Bounce Detection**: Physics-based detection of shots that hit the rim
+- **Entry Angle Analysis**: Calculates ball entry angle for better classification
+- **Trajectory Smoothing**: Kalman filtering for stable ball tracking
 
 ## Camera Setup
 
-This system is optimized for overhead/near-angle camera placement as shown in the reference image. The GoPro setup provides excellent coverage of the basketball court and hoop area.
+This system is designed for near-angle camera placement, with support for opposite-angle (far) camera integration. The system works with synced footage from both angles to maximize detection accuracy.
 
 ## Installation
 
@@ -29,274 +30,272 @@ cd Uball_near_angle_shot_detection
 pip install -r requirements.txt
 ```
 
-## Dataset
+3. Set up environment variables:
+```bash
+cp .env.example .env
+# Edit .env with your Supabase credentials for ground truth validation
+```
 
-The project includes a pre-configured basketball dataset with Basketball and Basketball Hoop annotations in YOLOv11 format located in the `basketball_dataset/` directory. The dataset contains:
+## Input Videos
 
-- **Training set**: Images and labels for model training
-- **Validation set**: Images and labels for model validation  
-- **Test set**: Images and labels for model evaluation
-- **Classes**: Basketball (class 0), Basketball Hoop (class 1)
+Place your original basketball game videos in the `input/` directory:
+- `input/game2_nearleft.mp4` - Game 2 near angle
+- `input/game3_nearleft.mp4` - Game 3 near angle
+- `input/game3_nearright.mp4` - Game 3 far angle (synced with near left)
+
+Processed videos and session JSONs will be saved alongside the input videos. Full validation results are saved in `results/[uuid]/`.
 
 ## Quick Start
 
-### 1. Train Your Model
+### 1. Process a Video with Enhanced Detection
+
+```bash
+# Process full video
+python main.py --action video \
+    --video_path input/game3_nearleft.mp4 \
+    --model runs/detect/basketball_yolo11n3/weights/best.pt
+```
+
+**Output:**
+- `input/game3_nearleft_detected.mp4` - Video with shot annotations
+- `input/game3_nearleft_session.json` - Detailed shot data
+
+### 2. Process a Time Range (Faster Testing)
+
+```bash
+# Process first 2 minutes
+python main.py --action video \
+    --video_path input/game3_nearleft.mp4 \
+    --model runs/detect/basketball_yolo11n3/weights/best.pt \
+    --start_time 0 \
+    --end_time 120
+```
+
+### 3. Validate Accuracy Against Ground Truth
+
+```bash
+# Full validation with Supabase ground truth
+python main.py --action video \
+    --video_path input/game3_nearleft.mp4 \
+    --model runs/detect/basketball_yolo11n3/weights/best.pt \
+    --game_id a3c9c041-6762-450a-8444-413767bb6428 \
+    --validate_accuracy \
+    --angle LEFT
+```
+
+**Output Location:** `results/[uuid]/`
+- `detection_results.json` - All detected shots with enhanced analysis
+- `ground_truth.json` - Ground truth from Supabase
+- `accuracy_analysis.json` - Detailed accuracy metrics and mismatches
+- `session_summary.json` - Quick summary
+- `original_video.mp4` & `processed_video.mp4`
+
+### 4. Compare Algorithm Versions
+
+```bash
+python test_enhanced_detection.py \
+    --old results/OLD_UUID/detection_results.json \
+    --new results/NEW_UUID/detection_results.json \
+    --analyze
+```
+
+### 5. Train Custom Models (Optional)
 
 ```bash
 # Setup training environment
 python custom_training.py --action setup
 
-# Train the model (adjust epochs and batch size as needed)
-python custom_training.py --action train --epochs 50 --batch_size 8 --device cpu
-
-# Validate trained model
-python custom_training.py --action validate --model_path runs/detect/basketball_yolo11n/weights/best.pt
+# Train with custom dataset
+python custom_training.py --action train --epochs 50 --batch_size 8
 ```
 
-### 2. Test with Single Image/Screenshot
+## Enhanced Detection Algorithm
 
-```bash
-# Enhanced detection system (RECOMMENDED)
-python test_enhanced.py --image test.png --model runs/detect/basketball_yolo11n2/weights/best.pt --show
+The system uses a multi-factor analysis approach:
 
-# Basic detection system
-python test_simple.py --model runs/detect/basketball_yolo11n2/weights/best.pt --image test.png --show
+### Core Features
 
-# Test with pre-trained YOLO model (limited accuracy)
-python test_simple.py --image test.png
-```
+1. **Box Overlap Analysis**
+   - Calculates intersection between ball and hoop bounding boxes
+   - Tracks overlap percentage over time
+   - Uses weighted scoring for fast shots
 
-### 3. Live Camera Detection with Enhanced Shot Tracking
+2. **Entry Angle Detection**
+   - Calculates ball's approach angle to the hoop
+   - Steeper angles indicate higher make probability
+   - Helps distinguish swishes from rim bounces
 
-```bash
-# Enhanced live detection with physics-based shot analysis
-python main.py --action live --model runs/detect/basketball_yolo11n2/weights/best.pt
+3. **Post-Hoop Trajectory**
+   - Tracks ball movement after hoop interaction
+   - Detects if ball continues downward (made) or bounces back (missed)
+   - Uses Kalman filtering for smooth trajectory tracking
 
-# Enhanced live detection with specific camera
-python main.py --action live --model runs/detect/basketball_yolo11n2/weights/best.pt --camera 1
-```
+4. **Rim Bounce Detection**
+   - Multi-factor scoring: vertical velocity changes, trajectory reversals
+   - Confidence-based override for ambiguous cases
+   - Physics-based validation
 
-### 4. Process Videos with Enhanced Analysis
+5. **Duplicate Prevention**
+   - 2-second window to prevent multiple detections of same shot
+   - Position-based clustering for nearby shots
 
-```bash
-# Process single video with enhanced shot detection and overlay
-python main.py --action video --video_path your_video.mp4 --model runs/detect/basketball_yolo11n2/weights/best.pt
+### Decision Logic Thresholds
 
-# Process multiple videos in batch
-python main.py --action batch --video_dir videos/ --model runs/detect/basketball_yolo11n2/weights/best.pt --output_dir processed/
-```
-
-### 5. Export Trained Model
-
-```bash
-# Export model to ONNX format for deployment
-python custom_training.py --action export --model_path runs/detect/basketball_yolo11n/weights/best.pt --export_format onnx
-```
-
-## Custom Model Training
-
-If zero-shot detection doesn't provide sufficient accuracy, train a custom model:
-
-### 1. Set up Data Collection
-
-```bash
-# Create dataset structure
-python data_collection.py --action organize
-
-# Extract frames from videos
-python data_collection.py --action extract --video_dir raw_videos/
-```
-
-### 2. Annotate Data
-
-Use one of these annotation tools:
-- **LabelImg**: `pip install labelImg` (Recommended for YOLO format)
-- **Roboflow**: Online tool with auto-annotation features
-- **CVAT**: Professional annotation tool
-
-Classes to annotate:
-- `basketball` (class 0)
-- `basketball_hoop` (class 1)
-
-### 3. Train Model
-
-```bash
-# Setup training pipeline
-python custom_training.py --action setup
-
-# Train custom model
-python custom_training.py --action train --dataset_yaml basketball_dataset/dataset.yaml
-```
-
-### 4. Evaluate Model
-
-```bash
-python custom_training.py --action evaluate --model_path runs/detect/train/weights/best.pt --dataset_yaml basketball_dataset/dataset.yaml
-```
+- **Certain Made**: 6+ frames at 100% overlap OR 4+ at 100% with 7+ at 95%
+- **Certain Missed**: High-confidence rim bounce detection (>60%)
+- **Fast Swish**: Weighted overlap score 3.5+ with good indicators
+- **Ambiguous**: Moderate overlap requires supporting evidence
 
 ## Project Structure
 
 ```
-├── main.py                 # Main application entry point
-├── shot_detection.py       # Core shot detection and tracking logic
-├── custom_training.py      # Model training pipeline
-├── data_collection.py      # Data collection and organization
-├── evaluation.py           # Evaluation metrics and benchmarking
-├── zero_shot_test.py       # Zero-shot detection testing
-├── test_simple.py          # Simple detection test
-├── requirements.txt        # Python dependencies
-└── basketball_dataset/     # Dataset directory (created during setup)
-    ├── images/
-    │   ├── train/
-    │   ├── val/
-    │   └── test/
-    ├── labels/
-    │   ├── train/
-    │   ├── val/
-    │   └── test/
-    └── dataset.yaml
+├── input/                          # Input videos (tracked in git)
+│   ├── game2_nearleft.mp4
+│   ├── game3_nearleft.mp4
+│   └── game3_nearright.mp4
+├── results/                        # Validation outputs (ignored by git)
+│   └── [uuid]/
+│       ├── detection_results.json
+│       ├── ground_truth.json
+│       ├── accuracy_analysis.json
+│       └── processed_video.mp4
+├── docs/                           # Documentation & references
+│   └── reference_images/
+├── runs/                           # YOLO training runs (ignored by git)
+│   └── detect/
+│       └── basketball_yolo11n3/
+│           └── weights/best.pt
+├── main.py                         # Main entry point
+├── shot_detection.py               # Enhanced shot detection logic
+├── accuracy_validator.py           # Ground truth validation
+├── custom_training.py              # Model training pipeline
+├── test_enhanced_detection.py      # Compare detection results
+├── requirements.txt                # Python dependencies
+├── SCRIPTS_REFERENCE.md            # Complete command reference
+├── IMPROVEMENTS_V2.md              # Algorithm improvements plan
+└── TESTING_GUIDE.md                # Testing instructions
 ```
 
-## Usage Examples
+## Video-to-Game Mapping
 
-### Basic Video Processing
+For accuracy validation, map videos to Supabase game IDs:
 
-```python
-from shot_detection import ShotAnalyzer
+```bash
+# input/game3_nearleft.mp4
+--game_id a3c9c041-6762-450a-8444-413767bb6428 --angle LEFT
 
-# Initialize analyzer
-analyzer = ShotAnalyzer('yolo11n.pt')  # or path to custom model
+# input/game3_nearright.mp4 (synced with near left, no offset)
+--game_id a3c9c041-6762-450a-8444-413767bb6428 --angle RIGHT
 
-# Process video
-results = analyzer.process_video('basketball_game.mp4', 'output_with_tracking.mp4')
-
-print(f"Detected {len(results)} shots")
-for shot in results:
-    print(f"Frame {shot['frame']}: {shot['result']['outcome']} (confidence: {shot['result']['confidence']:.3f})")
+# input/game2_nearleft.mp4
+--game_id c07e85e8-9ae4-4adc-a757-3ca00d9d292a --angle RIGHT
 ```
 
-### Custom Model Training
+## Common Commands
 
-```python
-from custom_training import BasketballTrainer
+See [`SCRIPTS_REFERENCE.md`](SCRIPTS_REFERENCE.md) for complete command reference.
 
-# Setup trainer
-trainer = BasketballTrainer('basketball_dataset/dataset.yaml')
-
-# Train model
-results = trainer.train_model(
-    model_size='n',  # nano model for speed
-    epochs=100,
-    batch_size=16
-)
-
-# Validate
-val_results = trainer.validate_model()
+### Quick Test (2 minutes)
+```bash
+python main.py --action video \
+    --video_path input/game3_nearleft.mp4 \
+    --model runs/detect/basketball_yolo11n3/weights/best.pt \
+    --start_time 0 --end_time 120
 ```
 
-### Performance Evaluation
-
-```python
-from evaluation import ShotDetectionEvaluator
-
-# Load ground truth and predictions
-evaluator = ShotDetectionEvaluator()
-evaluator.load_ground_truth('ground_truth.json')
-evaluator.load_predictions('predictions.json')
-
-# Calculate metrics
-evaluator.calculate_detection_metrics()
-evaluator.calculate_shot_classification_metrics()
-
-# Generate report
-evaluator.generate_report('evaluation_report.json')
+### Validate Full Game
+```bash
+python main.py --action video \
+    --video_path input/game3_nearleft.mp4 \
+    --model runs/detect/basketball_yolo11n3/weights/best.pt \
+    --game_id a3c9c041-6762-450a-8444-413767bb6428 \
+    --validate_accuracy --angle LEFT
 ```
 
-## Configuration
-
-Key parameters in `shot_detection.py`:
-
-```python
-# Shot detection sensitivity
-min_shot_distance = 100          # Minimum movement for shot detection
-peak_detection_frames = 5        # Frames to confirm trajectory peak
-hoop_proximity_threshold = 50    # Pixels from hoop for made shot
-
-# Model confidence thresholds
-basketball_confidence = 0.5      # Minimum confidence for basketball detection
-hoop_confidence = 0.5           # Minimum confidence for hoop detection
+### Compare Results
+```bash
+python test_enhanced_detection.py \
+    --old results/OLD_UUID/detection_results.json \
+    --new results/NEW_UUID/detection_results.json \
+    --analyze
 ```
 
-## Performance Benchmarks
+## Accuracy Metrics
 
-### Zero-shot YOLO Performance
-- Basketball detection: Limited (depends on sports ball class in COCO)
-- Hoop detection: Poor (no specific hoop class in COCO)
-- **Recommendation**: Use custom training for production
+The system calculates detailed accuracy metrics:
 
-### Custom Model Performance (Expected)
-- Basketball detection: >90% accuracy with proper training data
-- Hoop detection: >85% accuracy with proper training data
-- Inference speed: ~30-60 FPS on modern GPUs
+### Detection Accuracy
+- **Total Detected vs Ground Truth**: Count comparison
+- **Timestamp Matching**: 2-second window for matches
+- **Matched Correct/Incorrect**: Outcome classification accuracy
+- **Unmatched/Extra**: Detection precision
 
-## Evaluation Metrics
+### Outcome Classification
+- **Made Shot Accuracy**: True positive rate for made shots
+- **Missed Shot Accuracy**: True positive rate for missed shots
+- **Overall Accuracy**: Combined classification accuracy
+- **Confidence Distribution**: Per-outcome confidence analysis
 
-### Object Detection
-- **Precision**: Percentage of detected objects that are correct
-- **Recall**: Percentage of actual objects that are detected
-- **F1-Score**: Harmonic mean of precision and recall
-- **mAP**: Mean Average Precision across confidence thresholds
+### Latest Results (Game 3 Near Left)
+- Detection: ~77-83% outcome accuracy (baseline)
+- Target: 90%+ with enhanced multi-factor analysis
+- Future: 95%+ with dual-camera fusion
 
-### Shot Classification
-- **Accuracy**: Percentage of correctly classified shots
-- **Precision/Recall**: Per-class performance for made/missed shots
-- **Confidence Distribution**: Analysis of prediction confidence scores
+## Performance Characteristics
 
-### Trajectory Tracking
-- **Mean Trajectory Error**: Average pixel distance from ground truth
-- **Temporal Consistency**: Frame-to-frame tracking stability
+- **Processing Speed**: ~5-15 FPS (post-processing, not optimized for real-time)
+- **Model**: YOLOv11n (nano) for speed vs accuracy balance
+- **Memory**: ~2-4GB for video processing
+- **GPU**: Optional (CPU processing is supported)
 
 ## Troubleshooting
 
-### Common Issues
+### PyTorch 2.6+ Weight Loading Error
 
-1. **No objects detected**: 
-   - Check camera angle and lighting
-   - Adjust confidence thresholds
-   - Consider custom model training
+If you encounter `_pickle.UnpicklingError: Weights only load failed`:
+- **Fixed**: The code now handles PyTorch 2.6+ security changes
+- **Solution**: `torch.serialization.add_safe_globals([DetectionModel])` is called automatically
 
-2. **Poor shot classification**:
-   - Verify hoop position detection
-   - Adjust trajectory analysis parameters
-   - Increase training data for custom model
+### Low Accuracy
 
-3. **Slow processing**:
-   - Use smaller YOLO model (yolo11n vs yolo11x)
-   - Reduce video resolution
-   - Use GPU acceleration
+1. **Check Hoop Detection**: Ensure hoop is consistently detected
+2. **Review Overlap Thresholds**: Adjust in `shot_detection.py` if needed
+3. **Validate Time Ranges**: Test specific problematic timestamps
+4. **Check Ground Truth**: Ensure Supabase data is correct and synced
 
-### Debug Mode
+### Missing Detections
 
-Enable debug output:
-```python
-# In shot_detection.py, set verbose=True
-results = self.model(frame, conf=0.5, verbose=True)
-```
+1. **Ball Occlusion**: Ball hidden behind players/structures
+2. **Low Confidence**: Adjust YOLO confidence threshold
+3. **Fast Motion**: Ball moves too quickly between frames
+4. **Camera Angle**: Some shots may be out of view
 
-## Contributing
+## Next Steps
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests for new functionality
-5. Submit a pull request
+1. **Single-Camera Optimization** (Current Phase)
+   - Refine multi-factor analysis thresholds
+   - Improve rim bounce detection
+   - Target: 90%+ accuracy
 
-## License
+2. **Dual-Camera Integration** (Next Phase)
+   - Correlate detections from synced opposite cameras
+   - Fusion algorithm for combined decision making
+   - Target: 95%+ accuracy
 
-[Your License Here]
+3. **Production Deployment**
+   - Optimize processing speed
+   - Batch processing pipeline
+   - API integration
+
+## References
+
+- **SCRIPTS_REFERENCE.md**: Complete command reference
+- **IMPROVEMENTS_V2.md**: Algorithm enhancement plan
+- **TESTING_GUIDE.md**: Testing instructions
 
 ## Acknowledgments
 
-- YOLOv11 by Ultralytics
-- OpenCV for computer vision operations
-- Basketball community for testing and feedback
+- **YOLOv11** by Ultralytics - Object detection framework
+- **OpenCV** - Computer vision operations
+- **FilterPy** - Kalman filtering for trajectory smoothing
+- **SciPy** - Gaussian smoothing for signal processing
