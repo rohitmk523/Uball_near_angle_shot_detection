@@ -741,6 +741,10 @@ class ShotAnalyzer:
             post_hoop_analysis['ball_bounces_back']
         )
         
+        # IMPROVEMENT A: Free Throw Detection and Handling
+        # Free throws have unique characteristics: steep angle (75-90°) + high overlap
+        is_free_throw = (entry_angle is not None and entry_angle >= 75 and avg_overlap >= 70)
+        
         # Decision Factor 1: Very High Overlap (Certain Made Shots)
         # Requires minimum 4+ frames at 100% OR 7+ frames at 95%+ to be confident
         if frames_with_100_percent >= 6 or (frames_with_100_percent >= 4 and frames_with_95_percent >= 7):
@@ -759,6 +763,13 @@ class ShotAnalyzer:
                 outcome = "missed"
                 outcome_reason = "steep_entry_bounce_back"
                 decision_confidence = 0.85
+            # IMPROVEMENT C: Rim Rattler Detection (8+ frames can have higher rim bounce)
+            # Ball can hit rim and still go in with very high overlap
+            elif frames_with_100_percent >= 8 and bounce_confidence >= 0.7 and bounce_confidence < 0.95:
+                # Rim rattler: 8+ perfect frames, even with high rim bounce, likely went in
+                outcome = "made"
+                outcome_reason = "perfect_overlap_rim_rattler"
+                decision_confidence = 0.80
             elif is_rim_bounce and bounce_confidence > 0.7 and not post_hoop_analysis['ball_continues_down']:
                 outcome = "missed"
                 outcome_reason = "rim_bounce_high_confidence"
@@ -778,6 +789,18 @@ class ShotAnalyzer:
             outcome = "missed"
             outcome_reason = "rim_bounce_detected"
             decision_confidence = bounce_confidence
+        
+        # IMPROVEMENT D: Lower Threshold for 5+ Frames at 100%
+        # For 5+ perfect frames with high overlap, be more lenient
+        elif frames_with_100_percent >= 5 and avg_overlap >= 80 and not is_rim_bounce:
+            # 5+ perfect frames with high average overlap
+            if bounce_confidence < 0.6:
+                outcome = "made"
+                outcome_reason = "perfect_overlap_high_frames"
+                decision_confidence = 0.82
+            else:
+                # Fall through to next decision factor
+                pass
         
         # Decision Factor 3: Good Overlap + Positive Indicators (Made Shots)
         # Includes 3+ frames at 100%
@@ -831,14 +854,32 @@ class ShotAnalyzer:
             downward_consistency = post_hoop_analysis.get('downward_consistency', 0)
             downward_movement = post_hoop_analysis.get('downward_movement', 0)
             
-            # IMPROVEMENT 2.4: Require additional validation for fast shots
-            # Require: high downward consistency (>=0.9), significant movement (>=40px), 
-            # low rim bounce risk (<0.2), reasonable entry angle (30-70°)
-            if (post_hoop_analysis['ball_continues_down'] and 
-                downward_consistency >= 0.9 and 
-                downward_movement >= 40 and 
-                bounce_confidence < 0.2 and
-                entry_angle is not None and 30 <= entry_angle < 70):
+            # IMPROVEMENT A: Free Throw Special Handling
+            if is_free_throw and frames_with_100_percent >= 2:
+                # Free throws have lenient requirements
+                if (downward_movement > 0 or downward_movement >= -10) and bounce_confidence < 0.7:
+                    outcome = "made"
+                    outcome_reason = "free_throw_made"
+                    decision_confidence = 0.85
+                else:
+                    outcome = "missed"
+                    outcome_reason = "insufficient_overlap"
+                    decision_confidence = 0.65
+            # IMPROVEMENT B: Relax 2-frame requirements for excellent downward movement
+            # For high overlap + excellent downward + good consistency
+            elif (avg_overlap >= 85 and 
+                  downward_consistency >= 0.8 and 
+                  downward_movement >= 150 and
+                  bounce_confidence < 0.3):
+                outcome = "made"
+                outcome_reason = "fast_clean_swish_high_quality"
+                decision_confidence = 0.85
+            # IMPROVEMENT 2.4: Original strict validation for lower quality
+            elif (post_hoop_analysis['ball_continues_down'] and 
+                  downward_consistency >= 0.9 and 
+                  downward_movement >= 40 and 
+                  bounce_confidence < 0.2 and
+                  entry_angle is not None and 30 <= entry_angle < 70):
                 outcome = "made"
                 outcome_reason = "fast_clean_swish"
                 decision_confidence = 0.75
