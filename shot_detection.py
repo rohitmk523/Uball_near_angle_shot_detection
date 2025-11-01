@@ -526,45 +526,13 @@ class ShotAnalyzer:
             downward_consistency = 0.5
             upward_consistency = 0.5
         
-        # IMPROVEMENT 1.3: Better rim bounce vs made shot bounce distinction
-        # Require significant upward movement (>20px) AND consistency (>0.6)
-        # This distinguishes strong rim bounce from slight deflection on made shots
-        significant_bounce_back = upward_movement > 20 and upward_consistency > 0.6
-        
-        # IMPROVEMENT 2.2: Extended analysis for deceleration/reversal pattern (rim hit signature)
-        # Track if downward movement decelerates or reverses (rim hit indicator)
-        deceleration_detected = False
-        reversal_detected = False
-        
-        if len(y_positions) >= 5:
-            # Analyze velocity pattern for deceleration
-            velocities = []
-            for i in range(len(y_positions)-1):
-                vel = abs(y_positions[i+1] - y_positions[i])
-                velocities.append(vel)
-            
-            if len(velocities) >= 3:
-                # Check for deceleration (decreasing velocity)
-                early_avg_vel = sum(velocities[:len(velocities)//2]) / (len(velocities)//2)
-                late_avg_vel = sum(velocities[len(velocities)//2:]) / (len(velocities) - len(velocities)//2)
-                if early_avg_vel > late_avg_vel * 1.5:  # Significant deceleration
-                    deceleration_detected = True
-                
-                # Check for reversal (downward then upward)
-                if downward_movement > 10 and upward_movement > 10:
-                    reversal_detected = True
-        
         return {
             'ball_continues_down': downward_movement > 15 and downward_consistency > 0.6,
-            'ball_bounces_back': significant_bounce_back,  # IMPROVEMENT 1.3: Stricter criteria
-            'ball_disappears': False,
-            'confidence': 0.0,
+            'ball_bounces_back': upward_movement > 15 and upward_consistency > 0.5,
             'downward_movement': downward_movement,
             'upward_movement': upward_movement,
             'downward_consistency': downward_consistency,
-            'upward_consistency': upward_consistency,
-            'deceleration_detected': deceleration_detected,  # IMPROVEMENT 2.2: Rim hit indicator
-            'reversal_detected': reversal_detected  # IMPROVEMENT 2.2: Rim hit indicator
+            'upward_consistency': upward_consistency
         }
     
     def _enhanced_rim_bounce_detection(self, overlap_frames, entry_angle, post_hoop_analysis):
@@ -576,26 +544,12 @@ class ShotAnalyzer:
         max_score = 5.0
         
         # Factor 1: Upward movement during overlap (strongest indicator)
-        # IMPROVEMENT 1.3: Already using stricter criteria from post_hoop_analysis
         if post_hoop_analysis.get('ball_bounces_back', False):
             bounce_score += 2.0
-        
-        # IMPROVEMENT 2.2: Additional factors for rim hit detection
-        if post_hoop_analysis.get('deceleration_detected', False):
-            bounce_score += 1.0  # Deceleration suggests rim hit
-        
-        if post_hoop_analysis.get('reversal_detected', False):
-            bounce_score += 1.0  # Reversal suggests rim hit
         
         # Factor 2: Low entry angle (ball approaching from side)
         if entry_angle is not None and entry_angle < 35:  # Less than 35° from horizontal
             bounce_score += 1.5
-        
-        # IMPROVEMENT 2.1: Steep entries can also hit rim
-        # For steep entries (40-70°), add moderate bounce score if other indicators present
-        if entry_angle is not None and 40 <= entry_angle <= 70:
-            if bounce_score >= 1.0:  # If already has some bounce indicators
-                bounce_score += 0.5  # Steep entries with bounce indicators more likely rim hit
         
         # Factor 3: Low overlap percentage (grazing the rim)
         max_overlap = max(f['overlap_percentage'] for f in overlap_frames)
@@ -617,57 +571,6 @@ class ShotAnalyzer:
         confidence = bounce_score / max_score
         
         return is_bounce, confidence
-    
-    def _analyze_overlap_pattern(self, overlap_frames):
-        """IMPROVEMENT 2.3: Analyze overlap pattern for rim hit signature
-        
-        Rim hits often show: Peak overlap → Gradual decrease → Sudden drop
-        Made shots often show: Peak overlap → Sustained overlap → Gradual decrease
-        """
-        if not overlap_frames or len(overlap_frames) < 4:
-            return {
-                'sudden_drop_detected': False,
-                'sustained_overlap': False,
-                'pattern_confidence': 0.0
-            }
-        
-        overlaps = [f['overlap_percentage'] for f in overlap_frames]
-        
-        # Find peak overlap position
-        peak_idx = overlaps.index(max(overlaps))
-        
-        # Check for sudden drop after peak (>30% drop in 2 frames)
-        sudden_drop_detected = False
-        if peak_idx < len(overlaps) - 2:
-            peak_val = overlaps[peak_idx]
-            after_peak = overlaps[peak_idx + 1:peak_idx + 3]
-            if after_peak:
-                min_after_peak = min(after_peak)
-                if peak_val - min_after_peak > 30:  # Sudden drop >30%
-                    sudden_drop_detected = True
-        
-        # Check for sustained overlap (overlap stays high for multiple frames)
-        sustained_overlap = False
-        if peak_idx > 0 and peak_idx < len(overlaps) - 1:
-            before_peak_avg = sum(overlaps[max(0, peak_idx-2):peak_idx]) / min(2, peak_idx)
-            after_peak_avg = sum(overlaps[peak_idx+1:min(len(overlaps), peak_idx+3)]) / min(2, len(overlaps) - peak_idx - 1)
-            peak_val = overlaps[peak_idx]
-            # Sustained if values around peak are close (within 10%)
-            if abs(before_peak_avg - peak_val) < 10 and abs(after_peak_avg - peak_val) < 10:
-                sustained_overlap = True
-        
-        # Calculate pattern confidence
-        pattern_confidence = 0.0
-        if sudden_drop_detected:
-            pattern_confidence = 0.7  # High confidence for rim hit pattern
-        elif sustained_overlap:
-            pattern_confidence = 0.8  # High confidence for made shot pattern
-        
-        return {
-            'sudden_drop_detected': sudden_drop_detected,
-            'sustained_overlap': sustained_overlap,
-            'pattern_confidence': pattern_confidence
-        }
 
     def _finalize_shot_sequence(self):
         """Enhanced shot sequence finalization with multi-factor analysis"""
@@ -717,9 +620,6 @@ class ShotAnalyzer:
             post_hoop_analysis
         )
         
-        # IMPROVEMENT 2.3: Analyze overlap pattern for rim hit signature
-        overlap_pattern = self._analyze_overlap_pattern(self.shot_sequence_overlaps)
-        
         # Calculate weighted overlap score (addresses fast shot blind spot)
         weighted_overlap_score = (
             frames_with_100_percent * 1.0 +
@@ -741,35 +641,15 @@ class ShotAnalyzer:
             post_hoop_analysis['ball_bounces_back']
         )
         
-        # IMPROVEMENT A: Free Throw Detection and Handling
-        # Free throws have unique characteristics: steep angle (75-90°) + high overlap
-        is_free_throw = (entry_angle is not None and entry_angle >= 75 and avg_overlap >= 70)
-        
         # Decision Factor 1: Very High Overlap (Certain Made Shots)
         # Requires minimum 4+ frames at 100% OR 7+ frames at 95%+ to be confident
         if frames_with_100_percent >= 6 or (frames_with_100_percent >= 4 and frames_with_95_percent >= 7):
-            downward_movement = post_hoop_analysis.get('downward_movement', 0)
-            
-            # FIX: Check for rim hit pattern (high max overlap but low average = rim sitting)
-            # This catches cases where ball sits on rim (100% overlap) but bounces out
-            if avg_overlap < 50 and downward_movement <= 0:
-                # Rim hit: high max overlap but low avg, and ball moving up or not moving down
-                outcome = "missed"
-                outcome_reason = "rim_hit_high_max_low_avg"
-                decision_confidence = 0.85
             # Check for rim bounce override (including steep entry bounce-back)
-            elif steep_entry_bounce_back:
+            if steep_entry_bounce_back:
                 # FIX 1: Steep entries that bounce back are rim bounces
                 outcome = "missed"
                 outcome_reason = "steep_entry_bounce_back"
                 decision_confidence = 0.85
-            # IMPROVEMENT C: Rim Rattler Detection (8+ frames can have higher rim bounce)
-            # Ball can hit rim and still go in with very high overlap
-            elif frames_with_100_percent >= 8 and bounce_confidence >= 0.7 and bounce_confidence < 0.95:
-                # Rim rattler: 8+ perfect frames, even with high rim bounce, likely went in
-                outcome = "made"
-                outcome_reason = "perfect_overlap_rim_rattler"
-                decision_confidence = 0.80
             elif is_rim_bounce and bounce_confidence > 0.7 and not post_hoop_analysis['ball_continues_down']:
                 outcome = "missed"
                 outcome_reason = "rim_bounce_high_confidence"
@@ -790,49 +670,17 @@ class ShotAnalyzer:
             outcome_reason = "rim_bounce_detected"
             decision_confidence = bounce_confidence
         
-        # IMPROVEMENT D: Lower Threshold for 5+ Frames at 100%
-        # For 5+ perfect frames with high overlap, be more lenient
-        elif frames_with_100_percent >= 5 and avg_overlap >= 80 and not is_rim_bounce:
-            # 5+ perfect frames with high average overlap
-            if bounce_confidence < 0.6:
-                outcome = "made"
-                outcome_reason = "perfect_overlap_high_frames"
-                decision_confidence = 0.82
-            else:
-                # Fall through to next decision factor
-                pass
-        
         # Decision Factor 3: Good Overlap + Positive Indicators (Made Shots)
         # Includes 3+ frames at 100%
         elif frames_with_100_percent >= 3 and not is_rim_bounce:
             # FIX 2: Enhanced downward continuation weight
             downward_consistency = post_hoop_analysis.get('downward_consistency', 0)
-            downward_movement = post_hoop_analysis.get('downward_movement', 0)
             
-            # IMPROVEMENT 2.1: For steep entries, require additional validation
+            # Additional checks for confidence
             if entry_angle is not None and entry_angle >= 40:  # Steep entry
-                # Always check rim bounce confidence first
-                if bounce_confidence > 0.4:
-                    # Steep entry with rim bounce indicators → MISSED
-                    outcome = "missed"
-                    outcome_reason = "steep_entry_rim_hit"
-                    decision_confidence = 0.85
-                elif bounce_confidence < 0.4:
-                    # Steep entry without rim bounce → check for strong downward continuation
-                    if downward_consistency > 0.8 and downward_movement > 30:
-                        # Strong downward continuation = clean steep shot → MADE
-                        outcome = "made"
-                        outcome_reason = "perfect_overlap_steep_entry"
-                        decision_confidence = 0.85
-                    else:
-                        # Weak downward continuation = likely rim hit → MISSED
-                        outcome = "missed"
-                        outcome_reason = "steep_entry_weak_downward"
-                        decision_confidence = 0.75
-                else:
-                    outcome = "made"
-                    outcome_reason = "perfect_overlap_steep_entry"
-                    decision_confidence = 0.85
+                outcome = "made"
+                outcome_reason = "perfect_overlap_steep_entry"
+                decision_confidence = 0.85
             elif post_hoop_analysis['ball_continues_down'] and downward_consistency >= 0.8:
                 # FIX 2: Strong downward continuation = higher confidence
                 outcome = "made"
@@ -848,43 +696,17 @@ class ShotAnalyzer:
                 decision_confidence = 0.75
         
         # Decision Factor 3b: Fast Clean Swish (NEW - FIX 3)
-        # IMPROVEMENT 2.4: Stricter fast shot validation
         # 2 frames at 100% with strong downward continuation
         elif frames_with_100_percent >= 2 and not is_rim_bounce:
             downward_consistency = post_hoop_analysis.get('downward_consistency', 0)
-            downward_movement = post_hoop_analysis.get('downward_movement', 0)
             
-            # IMPROVEMENT A: Free Throw Special Handling
-            if is_free_throw and frames_with_100_percent >= 2:
-                # Free throws have lenient requirements
-                if (downward_movement > 0 or downward_movement >= -10) and bounce_confidence < 0.7:
-                    outcome = "made"
-                    outcome_reason = "free_throw_made"
-                    decision_confidence = 0.85
-                else:
-                    outcome = "missed"
-                    outcome_reason = "insufficient_overlap"
-                    decision_confidence = 0.65
-            # IMPROVEMENT B: Relax 2-frame requirements for excellent downward movement
-            # For high overlap + excellent downward + good consistency
-            elif (avg_overlap >= 85 and 
-                  downward_consistency >= 0.8 and 
-                  downward_movement >= 150 and
-                  bounce_confidence < 0.3):
-                outcome = "made"
-                outcome_reason = "fast_clean_swish_high_quality"
-                decision_confidence = 0.85
-            # IMPROVEMENT 2.4: Original strict validation for lower quality
-            elif (post_hoop_analysis['ball_continues_down'] and 
-                  downward_consistency >= 0.9 and 
-                  downward_movement >= 40 and 
-                  bounce_confidence < 0.2 and
-                  entry_angle is not None and 30 <= entry_angle < 70):
+            # FIX 3: Allow 2 frames if downward continuation is very strong
+            if post_hoop_analysis['ball_continues_down'] and downward_consistency >= 0.8:
                 outcome = "made"
                 outcome_reason = "fast_clean_swish"
                 decision_confidence = 0.75
             else:
-                # Not enough evidence with only 2 frames
+                # Not enough evidence with only 2 frames and weak downward
                 outcome = "missed"
                 outcome_reason = "insufficient_overlap"
                 decision_confidence = 0.65
@@ -894,14 +716,8 @@ class ShotAnalyzer:
         elif weighted_overlap_score >= 3.5 and not is_rim_bounce:
             downward_consistency = post_hoop_analysis.get('downward_consistency', 0)
             
-            # IMPROVEMENT 2.3: Check overlap pattern for rim hit signature
-            if overlap_pattern['sudden_drop_detected']:
-                # Sudden drop pattern suggests rim hit → MISSED
-                outcome = "missed"
-                outcome_reason = "fast_swoosh_rim_hit_pattern"
-                decision_confidence = 0.70
-            elif post_hoop_analysis['ball_continues_down'] and downward_consistency >= 0.8:
-                # FIX 2: Enhanced downward weight for fast shots
+            # FIX 2: Enhanced downward weight for fast shots
+            if post_hoop_analysis['ball_continues_down'] and downward_consistency >= 0.8:
                 # Very strong downward = likely made
                 outcome = "made"
                 outcome_reason = "fast_swoosh_clean_strong"
@@ -920,19 +736,8 @@ class ShotAnalyzer:
         elif frames_with_95_percent >= 4 and avg_overlap >= 85:
             downward_consistency = post_hoop_analysis.get('downward_consistency', 0)
             
-            # IMPROVEMENT 2.3: Check overlap pattern for rim hit signature
-            if overlap_pattern['sudden_drop_detected']:
-                # Sudden drop pattern suggests rim hit → MISSED
-                outcome = "missed"
-                outcome_reason = "moderate_overlap_rim_hit_pattern"
-                decision_confidence = 0.70
-            elif overlap_pattern['sustained_overlap']:
-                # Sustained overlap suggests made shot → MADE
-                outcome = "made"
-                outcome_reason = "moderate_overlap_sustained"
-                decision_confidence = 0.75
-            elif post_hoop_analysis['ball_continues_down'] and downward_consistency >= 0.8:
-                # FIX 2: Use downward consistency for tiebreaker
+            # FIX 2: Use downward consistency for tiebreaker
+            if post_hoop_analysis['ball_continues_down'] and downward_consistency >= 0.8:
                 outcome = "made"
                 outcome_reason = "moderate_overlap_strong_downward"
                 decision_confidence = 0.70
@@ -944,49 +749,6 @@ class ShotAnalyzer:
                 outcome = "missed"
                 outcome_reason = "moderate_overlap_insufficient"
                 decision_confidence = 0.60
-        
-        # IMPROVEMENT 1.1: Moderate Overlap Made Shots (50-70% overlap)
-        # Handles made shots with moderate overlap that would otherwise be rejected
-        elif avg_overlap >= 50 and avg_overlap < 70 and not is_rim_bounce:
-            downward_consistency = post_hoop_analysis.get('downward_consistency', 0)
-            upward_consistency = post_hoop_analysis.get('upward_consistency', 0)
-            downward_movement = post_hoop_analysis.get('downward_movement', 0)
-            
-            # FIX: Require consistent downward movement AND actual downward direction
-            # Check that ball is actually moving down (downward_movement > 0), not just consistency
-            if (downward_consistency > 0.7 and 
-                upward_consistency < 0.3 and 
-                downward_movement > 0 and  # Actually moving down (positive = down in our coordinate system)
-                post_hoop_analysis['ball_continues_down']):  # Continues down flag
-                outcome = "made"
-                outcome_reason = "moderate_overlap_consistent_downward"
-                decision_confidence = 0.72
-            else:
-                outcome = "missed"
-                outcome_reason = "insufficient_overlap"
-                decision_confidence = 0.65
-        
-        # IMPROVEMENT 1.2: Steep Entry Clean Swish (40%+ overlap with steep entry >70°)
-        # Steep entries naturally have less overlap but can still go in
-        elif (entry_angle is not None and entry_angle >= 70 and 
-              avg_overlap >= 40 and avg_overlap < 50 and not is_rim_bounce):
-            downward_consistency = post_hoop_analysis.get('downward_consistency', 0)
-            downward_movement = post_hoop_analysis.get('downward_movement', 0)
-            
-            # FIX: Require consistent downward movement AND actual downward direction
-            # Critical: downward_movement > 0 means actually moving down
-            # downward_movement < 0 means moving UP (rim bounce)
-            if (downward_consistency > 0.6 and 
-                bounce_confidence < 0.3 and 
-                downward_movement > 0 and  # Actually moving down
-                post_hoop_analysis['ball_continues_down']):  # Continues down flag
-                outcome = "made"
-                outcome_reason = "steep_entry_clean_swish"
-                decision_confidence = 0.75
-            else:
-                outcome = "missed"
-                outcome_reason = "insufficient_overlap"
-                decision_confidence = 0.65
         
         # Decision Factor 6: Low Overlap (Missed Shots)
         else:
