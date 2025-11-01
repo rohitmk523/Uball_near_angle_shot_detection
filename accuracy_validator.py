@@ -48,14 +48,53 @@ class AccuracyValidator:
         self.logger = logging.getLogger(__name__)
         logging.basicConfig(level=logging.INFO)
         
-    def create_results_folder(self, base_path: str = "results") -> str:
-        """Create a new results folder with UUID"""
+    def create_results_folder(self, base_path: str = "results", video_path: str = None) -> str:
+        """Create a new results folder with name based on video path + UUID
+        
+        Example: input/09-22/game2_nearright.mp4 -> 09-22(2-NR)_a1b2c3d4-e5f6-7890-abcd-ef1234567890
+        """
+        import re
         results_dir = Path(base_path)
         results_dir.mkdir(exist_ok=True)
         
-        # Create UUID-based subfolder
-        session_uuid = str(uuid.uuid4())
-        session_dir = results_dir / session_uuid
+        # Generate folder name from video path
+        if video_path:
+            video_path_obj = Path(video_path)
+            filename = video_path_obj.stem  # game2_nearright
+            parent_name = video_path_obj.parent.name  # 09-22
+            
+            # Extract date prefix (e.g., "09-22")
+            date_prefix = parent_name if re.match(r'\d{2}-\d{2}', parent_name) else None
+            
+            # Extract game number (e.g., "2" from "game2")
+            game_match = re.search(r'game(\d+)', filename, re.IGNORECASE)
+            game_num = game_match.group(1) if game_match else None
+            
+            # Extract and convert angle to code
+            angle_mapping = {
+                'nearleft': 'NL', 'nearright': 'NR',
+                'farleft': 'FL', 'farright': 'FR',
+                'left': 'L', 'right': 'R'
+            }
+            angle_code = None
+            for angle_name, code in angle_mapping.items():
+                if angle_name in filename.lower():
+                    angle_code = code
+                    break
+            
+            # Build folder name: 09-22(2-NR)_<uuid>
+            session_uuid = str(uuid.uuid4())
+            if date_prefix and game_num and angle_code:
+                folder_name = f"{date_prefix}({game_num}-{angle_code})_{session_uuid}"
+            elif date_prefix:
+                folder_name = f"{date_prefix}_{filename}_{session_uuid}"
+            else:
+                folder_name = f"{filename.replace('_', '-')}_{session_uuid}"
+        else:
+            # Fallback to UUID if no video path
+            folder_name = str(uuid.uuid4())
+        
+        session_dir = results_dir / folder_name
         session_dir.mkdir(exist_ok=True)
         
         self.logger.info(f"Created results folder: {session_dir}")
@@ -370,12 +409,7 @@ class AccuracyValidator:
         with open(accuracy_file, 'w') as f:
             json.dump(accuracy_results, f, indent=2)
         
-        # Copy videos if provided
-        if video_path and Path(video_path).exists():
-            import shutil
-            original_video = session_path / f"original_video{Path(video_path).suffix}"
-            shutil.copy2(video_path, original_video)
-        
+        # Copy processed video only (not original to save space)
         if processed_video_path and Path(processed_video_path).exists():
             import shutil
             processed_video = session_path / f"processed_video{Path(processed_video_path).suffix}"
@@ -394,7 +428,6 @@ class AccuracyValidator:
                 'detection_results': 'detection_results.json',
                 'ground_truth': 'ground_truth.json',
                 'accuracy_analysis': 'accuracy_analysis.json',
-                'original_video': f"original_video{Path(video_path).suffix}" if video_path else None,
                 'processed_video': f"processed_video{Path(processed_video_path).suffix}" if processed_video_path else None
             },
             'quick_summary': {
@@ -424,8 +457,8 @@ class AccuracyValidator:
         
         self.logger.info(f"Starting validation for game_id: {game_id}")
         
-        # Create results folder
-        session_dir = self.create_results_folder()
+        # Create results folder with name based on video path
+        session_dir = self.create_results_folder(video_path=video_path)
         
         # Fetch ground truth
         ground_truth = self.fetch_ground_truth(game_id, angle)
