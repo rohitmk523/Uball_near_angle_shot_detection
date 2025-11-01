@@ -744,8 +744,17 @@ class ShotAnalyzer:
         # Decision Factor 1: Very High Overlap (Certain Made Shots)
         # Requires minimum 4+ frames at 100% OR 7+ frames at 95%+ to be confident
         if frames_with_100_percent >= 6 or (frames_with_100_percent >= 4 and frames_with_95_percent >= 7):
+            downward_movement = post_hoop_analysis.get('downward_movement', 0)
+            
+            # FIX: Check for rim hit pattern (high max overlap but low average = rim sitting)
+            # This catches cases where ball sits on rim (100% overlap) but bounces out
+            if avg_overlap < 50 and downward_movement <= 0:
+                # Rim hit: high max overlap but low avg, and ball moving up or not moving down
+                outcome = "missed"
+                outcome_reason = "rim_hit_high_max_low_avg"
+                decision_confidence = 0.85
             # Check for rim bounce override (including steep entry bounce-back)
-            if steep_entry_bounce_back:
+            elif steep_entry_bounce_back:
                 # FIX 1: Steep entries that bounce back are rim bounces
                 outcome = "missed"
                 outcome_reason = "steep_entry_bounce_back"
@@ -900,9 +909,14 @@ class ShotAnalyzer:
         elif avg_overlap >= 50 and avg_overlap < 70 and not is_rim_bounce:
             downward_consistency = post_hoop_analysis.get('downward_consistency', 0)
             upward_consistency = post_hoop_analysis.get('upward_consistency', 0)
+            downward_movement = post_hoop_analysis.get('downward_movement', 0)
             
-            # Require consistent downward movement and no bounce-back
-            if downward_consistency > 0.7 and upward_consistency < 0.3:
+            # FIX: Require consistent downward movement AND actual downward direction
+            # Check that ball is actually moving down (downward_movement > 0), not just consistency
+            if (downward_consistency > 0.7 and 
+                upward_consistency < 0.3 and 
+                downward_movement > 0 and  # Actually moving down (positive = down in our coordinate system)
+                post_hoop_analysis['ball_continues_down']):  # Continues down flag
                 outcome = "made"
                 outcome_reason = "moderate_overlap_consistent_downward"
                 decision_confidence = 0.72
@@ -916,9 +930,15 @@ class ShotAnalyzer:
         elif (entry_angle is not None and entry_angle >= 70 and 
               avg_overlap >= 40 and avg_overlap < 50 and not is_rim_bounce):
             downward_consistency = post_hoop_analysis.get('downward_consistency', 0)
+            downward_movement = post_hoop_analysis.get('downward_movement', 0)
             
-            # Require consistent downward movement and no rim bounce
-            if downward_consistency > 0.6 and bounce_confidence < 0.3:
+            # FIX: Require consistent downward movement AND actual downward direction
+            # Critical: downward_movement > 0 means actually moving down
+            # downward_movement < 0 means moving UP (rim bounce)
+            if (downward_consistency > 0.6 and 
+                bounce_confidence < 0.3 and 
+                downward_movement > 0 and  # Actually moving down
+                post_hoop_analysis['ball_continues_down']):  # Continues down flag
                 outcome = "made"
                 outcome_reason = "steep_entry_clean_swish"
                 decision_confidence = 0.75
